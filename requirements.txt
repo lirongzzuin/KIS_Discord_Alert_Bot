@@ -2,3 +2,5 @@ requests
 python-dotenv
 schedule
 websocket-client
+pytz
+redis
