@@ -8,7 +8,7 @@ from datetime import datetime
 from pytz import timezone
 from dotenv import load_dotenv
 
-# .env 로드
+# 환경 변수 로드
 load_dotenv()
 KIS_APP_KEY = os.getenv("KIS_APP_KEY")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
@@ -16,24 +16,27 @@ KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-r = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
+# Redis 연결
+try:
+    r = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
+    r.ping()
+except Exception as e:
+    print(f"Redis 연결 실패: {e}")
+    r = None
 
-# 디스코드 전송
 def send_discord_message(content):
     try:
-        res = requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
-        res.raise_for_status()
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
     except Exception as e:
         print(f"[디스코드 전송 오류] {e}")
 
-# 토큰 캐싱 및 발급
 def get_kis_access_token():
     now = time.time()
-    token = r.get("KIS_ACCESS_TOKEN")
-    expire_ts = r.get("KIS_TOKEN_EXPIRE_TIME")
-
-    if token and expire_ts and float(expire_ts) > now:
-        return token
+    if r:
+        token = r.get("KIS_ACCESS_TOKEN")
+        expire_ts = r.get("KIS_TOKEN_EXPIRE_TIME")
+        if token and expire_ts and float(expire_ts) > now:
+            return token
 
     url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
     headers = {"Content-Type": "application/json"}
@@ -42,18 +45,17 @@ def get_kis_access_token():
         "appkey": KIS_APP_KEY,
         "appsecret": KIS_APP_SECRET
     }
-
     res = requests.post(url, headers=headers, data=json.dumps(data)).json()
     if "access_token" not in res:
         raise Exception(f"[토큰 오류] {res}")
 
     token = res["access_token"]
     expires_in = int(res.get("expires_in", 86400))
-    r.set("KIS_ACCESS_TOKEN", token)
-    r.set("KIS_TOKEN_EXPIRE_TIME", now + expires_in - 60)
+    if r:
+        r.set("KIS_ACCESS_TOKEN", token)
+        r.set("KIS_TOKEN_EXPIRE_TIME", now + expires_in - 60)
     return token
 
-# 수급 정보
 def get_market_summary(token, stock_code):
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-investor"
     headers = {
@@ -67,23 +69,19 @@ def get_market_summary(token, stock_code):
         "FID_COND_MRKT_DIV_CODE": "J",
         "FID_INPUT_ISCD": stock_code
     }
-
     try:
         res = requests.get(url, headers=headers, params=params).json()
         if res.get("rt_cd") == "0" and res.get("output"):
             output = res["output"][0]
             frgn_raw = output.get("frgn_ntby_qty", "").replace(",", "").strip()
             inst_raw = output.get("orgn_ntby_qty", "").replace(",", "").strip()
-
             frgn = int(frgn_raw) if frgn_raw.replace("-", "").isdigit() else 0
             inst = int(inst_raw) if inst_raw.replace("-", "").isdigit() else 0
-
             return f"외국인 순매수: {frgn:+,}주 | 기관 순매수: {inst:+,}주"
         return "수급 정보 없음 또는 아직 제공되지 않음"
     except Exception as e:
         return f"수급 정보 오류: {e}"
 
-# 수익률 및 수급 리포트
 def get_account_profit():
     token = get_kis_access_token()
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -107,7 +105,6 @@ def get_account_profit():
         "CTX_AREA_FK100": "",
         "CTX_AREA_NK100": ""
     }
-
     res = requests.get(url, headers=headers, params=params).json()
     if res.get("rt_cd") != "0":
         raise Exception(f"API 응답 실패: {res}")
@@ -118,7 +115,6 @@ def get_account_profit():
 
     items = []
     total_profit = total_eval = total_invest = 0
-
     for item in output:
         try:
             name = item["prdt_name"]
@@ -131,7 +127,6 @@ def get_account_profit():
             profit = eval_amt - invest_amt
             rate = (profit / invest_amt * 100) if invest_amt else 0.0
             summary = get_market_summary(token, code)
-
             total_profit += profit
             total_eval += eval_amt
             total_invest += invest_amt
@@ -144,18 +139,16 @@ def get_account_profit():
             )
         except Exception as e:
             items.append(f"\n⚠️ {item.get('prdt_name', '알 수 없음')} 수익률 계산 오류: {e}")
-            continue
-
     total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
     items.append(
         f"\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     )
     return "\n📊 [보유 종목 수익률 + 수급 요약 보고]" + "".join(items)
 
-# 체결 내역 감지용: 마지막 체결된 주문번호 추적
+# 체결 감지용
 last_order_ids = set()
 
-# 체결 내역 확인
+# 체결 내역 확인 및 실시간 알림 + 잔고 리포트 재전송
 def check_order_and_notify():
     try:
         token = get_kis_access_token()
@@ -200,6 +193,7 @@ def check_order_and_notify():
                     f"단가: {order['ord_unpr']}원"
                 )
                 send_discord_message(msg)
+                send_discord_message(get_account_profit())  # 체결 후 잔고 리포트 전송
                 last_order_ids.add(odno)
     except Exception as e:
         send_discord_message(f"❌ 체결 알림 오류: {e}")
@@ -208,16 +202,16 @@ def check_order_and_notify():
 def run():
     send_discord_message("✅ 디스코드 체결/수익률 알림 봇이 시작되었습니다.")
 
-    # 최초 실행 시 리포트
+    # 최초 리포트
     try:
         send_discord_message(get_account_profit())
     except Exception as e:
         send_discord_message(f"❌ 초기 리포트 오류: {e}")
 
-    # 체결 내역은 계속 감지
+    # 체결 감지: 장중 1분 단위 감시
     schedule.every(1).minutes.do(check_order_and_notify)
 
-    # 수익률/수급 리포트는 하루 3번만 전송
+    # 수익률/수급 리포트: 09시 / 12시 / 16시에 전송
     schedule.every().day.at("09:00").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("12:00").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("16:00").do(lambda: send_discord_message(get_account_profit()))
