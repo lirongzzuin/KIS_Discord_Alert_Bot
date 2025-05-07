@@ -58,6 +58,13 @@ def get_kis_access_token():
         r.set("KIS_TOKEN_EXPIRE_TIME", now + expires_in - 60)
     return token
 
+def parse_int_field(value):
+    value = (value or "").replace(",", "").strip()
+    try:
+        return int(value)
+    except ValueError:
+        return 0
+
 def get_market_summary(token, stock_code):
     now = datetime.now(timezone('Asia/Seoul'))
     if now.hour < 15 or (now.hour == 15 and now.minute < 30):
@@ -79,14 +86,15 @@ def get_market_summary(token, stock_code):
         res = requests.get(url, headers=headers, params=params).json()
         if res.get("rt_cd") == "0" and res.get("output"):
             output = res["output"][0]
-            frgn = int(output.get("frgn_ntby_qty", "0").replace(",", "").strip() or 0)
-            inst = int(output.get("orgn_ntby_qty", "0").replace(",", "").strip() or 0)
+            frgn = parse_int_field(output.get("frgn_ntby_qty"))
+            inst = parse_int_field(output.get("orgn_ntby_qty"))
             frgn_str = f"🟢 매수 {frgn:+,}주" if frgn > 0 else f"🔴 매도 {frgn:+,}주"
             inst_str = f"🟢 매수 {inst:+,}주" if inst > 0 else f"🔴 매도 {inst:+,}주"
             return f"외국인: {frgn_str} | 기관: {inst_str}"
         return "수급 정보 없음 또는 제공되지 않음"
     except Exception as e:
         return f"수급 정보 오류: {e}"
+
 
 def get_account_profit():
     token = get_kis_access_token()
