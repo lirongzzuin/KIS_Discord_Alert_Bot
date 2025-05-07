@@ -1,9 +1,6 @@
-pykis
 requests
 python-dotenv
-schedule
-websocket-client
-pytz
 redis
-typing_extensions
-python-kis
+schedule
+pytz
+pandas
