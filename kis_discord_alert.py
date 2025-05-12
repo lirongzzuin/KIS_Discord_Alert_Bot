@@ -17,7 +17,6 @@ KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
-# Redis 연결
 try:
     r = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
     r.ping()
@@ -67,7 +66,7 @@ def parse_int_field(value):
 
 def get_market_summary(token, stock_code):
     now = datetime.now(timezone('Asia/Seoul'))
-    if now.hour < 15 or (now.hour == 15 and now.minute < 30):
+    if now.hour < 15 or (now.hour == 15 and now.minute < 40):
         return ""  # 장중에는 생략
 
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-investor"
@@ -95,7 +94,6 @@ def get_market_summary(token, stock_code):
     except Exception as e:
         return f"수급 정보 오류: {e}"
 
-
 def get_account_profit():
     token = get_kis_access_token()
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -117,7 +115,7 @@ def get_account_profit():
         "OFL_YN": "N",
         "PRCS_DVSN": "00",
         "CTX_AREA_FK100": "P",
-        "CTX_AREA_NK100": ""  # 반드시 포함해야 함
+        "CTX_AREA_NK100": ""
     }
 
     res = requests.get(url, headers=headers, params=params).json()
@@ -134,6 +132,7 @@ def get_account_profit():
     new_holdings = {}
     parsed_items = []
     total_profit = total_eval = total_invest = 0
+    changes = []
 
     for item in output:
         try:
@@ -164,24 +163,22 @@ def get_account_profit():
             total_profit += profit
             total_eval += eval_amt
             total_invest += invest_amt
-        except Exception as e:
-            parsed_items.append({"name": item.get("prdt_name", "알 수 없음"), "flow": f"수익률 계산 오류: {e}", "eval": 0})
 
-    parsed_items.sort(key=lambda x: x.get("eval", 0), reverse=True)
-
-    changes = []
-    if last:
-        for name, qty in new_holdings.items():
+            # 잔고 변동 감지 및 출력용 추가 정보
             old_qty = last.get(name, 0)
             if qty != old_qty:
                 diff = qty - old_qty
                 arrow = "🟢 증가" if diff > 0 else "🔴 감소"
-                matched = next((i for i in parsed_items if i['name'] == name), None)
-                if matched:
-                    changes.append(
-                        f"{name} 수량 {arrow}: {old_qty} → {qty}주\n"
-                        f"┗ 수익금: {matched['profit']:,}원 | 수익률: {matched['rate']:.2f}%"
-                    )
+                realized = abs(diff) * (cur_price - avg_price)
+                changes.append(
+                    f"{name} 수량 {arrow}: {old_qty} → {qty}주\n"
+                    f"┗ 수익금: {profit:,}원 | 수익률: {rate:.2f}%"
+                    + (f"\n┗ 매도 추정 수익: {int(realized):,}원" if diff < 0 else "")
+                )
+        except Exception as e:
+            parsed_items.append({"name": item.get("prdt_name", "알 수 없음"), "flow": f"수익률 계산 오류: {e}", "eval": 0})
+
+    parsed_items.sort(key=lambda x: x.get("eval", 0), reverse=True)
 
     if r:
         r.set("LAST_HOLDINGS", json.dumps(new_holdings))
@@ -214,6 +211,7 @@ def run():
     schedule.every().day.at("12:00").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("13:30").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("15:30").do(lambda: send_discord_message(get_account_profit()))
+    schedule.every().day.at("16:00").do(lambda: send_discord_message(get_account_profit()))
 
     while True:
         try:
