@@ -8,6 +8,7 @@ import traceback
 from datetime import datetime
 from pytz import timezone
 from dotenv import load_dotenv
+from threading import Thread
 
 # 환경 변수 로드
 load_dotenv()
@@ -164,7 +165,6 @@ def get_account_profit():
             total_eval += eval_amt
             total_invest += invest_amt
 
-            # 잔고 변동 감지 및 출력용 추가 정보
             old_qty = last.get(name, 0)
             if qty != old_qty:
                 diff = qty - old_qty
@@ -199,6 +199,18 @@ def get_account_profit():
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
 
+def check_holdings_change_loop():
+    while True:
+        try:
+            prev = r.get("LAST_HOLDINGS") if r else None
+            current_report = get_account_profit()
+            if "📌 [잔고 변동 내역]" in current_report:
+                send_discord_message(current_report)
+        except Exception as e:
+            send_discord_message(f"❌ 자동 잔고 체크 오류: {e}")
+            traceback.print_exc()
+        time.sleep(300)  # 5분마다 확인
+
 def run():
     send_discord_message("✅ 디스코드 체결/수익률 알림 봇이 시작되었습니다.")
     try:
@@ -207,11 +219,13 @@ def run():
         send_discord_message(f"❌ 리포트 오류: {e}")
         traceback.print_exc()
 
+    schedule.every().day.at("08:30").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("09:30").do(lambda: send_discord_message(get_account_profit()))
-    schedule.every().day.at("12:00").do(lambda: send_discord_message(get_account_profit()))
-    schedule.every().day.at("13:30").do(lambda: send_discord_message(get_account_profit()))
+    schedule.every().day.at("13:00").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("15:30").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("16:00").do(lambda: send_discord_message(get_account_profit()))
+
+    Thread(target=check_holdings_change_loop, daemon=True).start()
 
     while True:
         try:
