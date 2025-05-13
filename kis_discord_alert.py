@@ -32,6 +32,16 @@ def send_discord_message(content):
         print(f"[디스코드 전송 오류] {e}")
         traceback.print_exc()
 
+# 평일 여부 확인 함수
+def is_weekday():
+    now = datetime.now(timezone('Asia/Seoul'))
+    return now.weekday() < 5
+
+# 장중 여부 확인 함수 (오전 9시 ~ 오후 3시)
+def is_market_hour():
+    now = datetime.now(timezone('Asia/Seoul'))
+    return now.hour >= 9 and now.hour < 15
+
 def get_kis_access_token():
     now = time.time()
     if r:
@@ -199,17 +209,26 @@ def get_account_profit():
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
 
+# 5분마다 잔고 체크 + 잔고 변동 없을 때도 2시간 간격 상태 보고
+last_status_report = 0
+
 def check_holdings_change_loop():
+    global last_status_report
     while True:
         try:
-            prev = r.get("LAST_HOLDINGS") if r else None
-            current_report = get_account_profit()
-            if "📌 [잔고 변동 내역]" in current_report:
-                send_discord_message(current_report)
+            if is_weekday() and is_market_hour():
+                current_report = get_account_profit()
+                now = time.time()
+                if "📌 [잔고 변동 내역]" in current_report:
+                    send_discord_message(current_report)
+                    last_status_report = now
+                elif now - last_status_report >= 7200:
+                    send_discord_message("✅ 잔고 모니터링 정상 작동 중 (최근 2시간 내 변동 없음)")
+                    last_status_report = now
         except Exception as e:
             send_discord_message(f"❌ 자동 잔고 체크 오류: {e}")
             traceback.print_exc()
-        time.sleep(300)  # 5분마다 확인
+        time.sleep(300)
 
 def run():
     send_discord_message("✅ 디스코드 체결/수익률 알림 봇이 시작되었습니다.")
@@ -219,24 +238,25 @@ def run():
         send_discord_message(f"❌ 리포트 오류: {e}")
         traceback.print_exc()
 
-    schedule.every().day.at("08:30").do(lambda: send_discord_message(get_account_profit()))
-    schedule.every().day.at("09:30").do(lambda: send_discord_message(get_account_profit()))
-    schedule.every().day.at("13:00").do(lambda: send_discord_message(get_account_profit()))
+    schedule.every().day.at("09:10").do(lambda: send_discord_message(get_account_profit()))
+    schedule.every().day.at("12:00").do(lambda: send_discord_message(get_account_profit()))
+    schedule.every().day.at("13:30").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("15:30").do(lambda: send_discord_message(get_account_profit()))
     schedule.every().day.at("16:00").do(lambda: send_discord_message(get_account_profit()))
 
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
-    while True:
-        try:
+    try:
+        while True:
             schedule.run_pending()
             time.sleep(1)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            send_discord_message(f"❌ 알림 루프 오류: {e}")
-            traceback.print_exc()
-            time.sleep(10)
+    except KeyboardInterrupt:
+        send_discord_message("🛑 디스코드 잔고 알림 봇 실행 종료됨 (수동 중지)")
+        pass
+    except Exception as e:
+        send_discord_message(f"❌ 알림 루프 오류: {e}")
+        traceback.print_exc()
+        time.sleep(10)
 
 if __name__ == "__main__":
     run()
