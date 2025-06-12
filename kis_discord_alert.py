@@ -16,6 +16,8 @@ KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
 KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 only_changes = True  # 실시간 감지 시 잔고 변동 사항만 보낼지 여부
 
@@ -26,11 +28,29 @@ except Exception as e:
     print(f"Redis 연결 실패: {e}")
     r = None
 
+def send_alert_message(content):
+    send_discord_message(content)
+    send_telegram_message(content)
+
+
 def send_discord_message(content):
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": content})
     except Exception as e:
         print(f"[디스코드 전송 오류] {e}")
+        traceback.print_exc()
+
+def send_telegram_message(content):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": content
+        }
+        res = requests.post(url, data=payload)
+        res.raise_for_status()
+    except Exception as e:
+        print(f"[텔레그램 전송 오류] {e}")
         traceback.print_exc()
 
 def is_weekday():
@@ -221,28 +241,28 @@ def check_holdings_change_loop():
                 now = datetime.now(timezone('Asia/Seoul'))
                 report = get_account_profit(only_changes=True if only_changes else False)
                 if report:
-                    send_discord_message(report)
+                    send_alert_message(report)
                 elif now.minute == 0 and now.hour % 2 == 1 and now.hour != last_status_report_hour:
-                    send_discord_message(get_account_profit(only_changes=False))
+                    send_alert_message(get_account_profit(only_changes=False))
                     last_status_report_hour = now.hour
         except Exception as e:
-            send_discord_message(f"❌ 자동 잔고 체크 오류: {e}")
+            send_alert_message(f"❌ 자동 잔고 체크 오류: {e}")
             traceback.print_exc()
         time.sleep(60)
 
 def run():
-    send_discord_message("✅ 디스코드 체결/수익률 알림 봇이 시작되었습니다.")
+    send_alert_message("✅ 체결/수익률 알림 봇이 시작되었습니다.")
     try:
-        send_discord_message(get_account_profit(only_changes=False))
+        send_alert_message(get_account_profit(only_changes=False))
     except Exception as e:
-        send_discord_message(f"❌ 리포트 오류: {e}")
+        send_alert_message(f"❌ 리포트 오류: {e}")
         traceback.print_exc()
 
-    schedule.every().day.at("08:30").do(lambda: send_discord_message(get_account_profit(False)))
-    schedule.every().day.at("09:30").do(lambda: send_discord_message(get_account_profit(False)))
-    schedule.every().day.at("13:30").do(lambda: send_discord_message(get_account_profit(False)))
-    schedule.every().day.at("15:30").do(lambda: send_discord_message(get_account_profit(False)))
-    schedule.every().day.at("16:00").do(lambda: send_discord_message(get_account_profit(False)))
+    schedule.every().day.at("08:30").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("09:30").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("13:30").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("15:30").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("16:00").do(lambda: send_alert_message(get_account_profit(False)))
 
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
@@ -251,9 +271,9 @@ def run():
             schedule.run_pending()
             time.sleep(1)
     except KeyboardInterrupt:
-        send_discord_message("🛑 디스코드 잔고 알림 봇 실행 종료됨 (수동 중지)")
+        send_alert_message("🛑 디스코드 잔고 알림 봇 실행 종료됨 (수동 중지)")
     except Exception as e:
-        send_discord_message(f"❌ 알림 루프 오류: {e}")
+        send_alert_message(f"❌ 알림 루프 오류: {e}")
         traceback.print_exc()
         time.sleep(10)
 
