@@ -122,6 +122,18 @@ def get_market_summary(token, stock_code):
     except Exception as e:
         return f"수급 정보 오류: {e}"
 
+def safe_int(val):
+    try:
+        return int(str(val).replace(",", "").strip())
+    except:
+        return 0
+
+def safe_float(val):
+    try:
+        return float(str(val).replace(",", "").strip())
+    except:
+        return 0.0
+
 def get_account_profit(only_changes=True):
     token = get_kis_access_token()
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
@@ -146,6 +158,7 @@ def get_account_profit(only_changes=True):
         "CTX_AREA_NK100": ""
     }
     res = requests.get(url, headers=headers, params=params).json()
+
     if res.get("rt_cd") != "0":
         raise Exception(f"API 응답 실패: {res}")
 
@@ -163,17 +176,28 @@ def get_account_profit(only_changes=True):
 
     for item in output:
         try:
-            qty = int(item["hldg_qty"])
+            qty = safe_int(item["hldg_qty"])
             if qty == 0:
                 continue
 
-            name = item["prdt_name"]
-            code = item["pdno"]
-            avg_price = float(item["pchs_avg_pric"])
-            cur_price = float(item["prpr"])
-            eval_amt = int(item["evlu_amt"])  # 평가금액
-            profit = int(item["evlu_erng_amt"])  # 수익금
-            rate = float(item["evlu_pfls_rt"])  # 수익률
+            name = item.get("prdt_name", "알수없음")
+            code = item.get("pdno", "")
+            avg_price = safe_float(item.get("pchs_avg_pric"))
+            cur_price = safe_float(item.get("prpr"))
+
+            eval_amt = safe_int(item.get("evlu_amt"))
+            profit = safe_int(item.get("evlu_erng_amt"))
+            rate = safe_float(item.get("evlu_pfls_rt"))
+
+            # Fallback: 수익금, 수익률 직접 계산 (API값이 0일 경우)
+            if eval_amt == 0:
+                eval_amt = int(qty * cur_price)
+            if profit == 0:
+                invest_amt = int(qty * avg_price)
+                profit = eval_amt - invest_amt
+            if rate == 0 and avg_price > 0:
+                rate = (profit / (qty * avg_price)) * 100
+
             investor_flow = get_market_summary(token, code)
 
             new_holdings[name] = qty
@@ -197,6 +221,8 @@ def get_account_profit(only_changes=True):
                     + (f"\n┗ 매도 추정 수익: {int(realized):,}원" if diff < 0 else "")
                 )
         except Exception as e:
+            print(f"[파싱 오류] {e}")
+            traceback.print_exc()
             continue
 
     parsed_items.sort(key=lambda x: x.get("eval", 0), reverse=True)
@@ -221,7 +247,6 @@ def get_account_profit(only_changes=True):
     total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
-
 
 last_status_report_hour = None
 HOLIDAYS = ["2024-01-01", "2024-02-09", "2024-02-12", "2024-03-01", "2024-05-01", "2024-05-05", "2024-05-06", "2024-06-06", "2024-08-15", "2024-09-16", "2024-09-17", "2024-09-18", "2024-10-03", "2024-10-09", "2024-12-25"]
