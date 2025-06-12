@@ -171,10 +171,9 @@ def get_account_profit(only_changes=True):
             code = item["pdno"]
             avg_price = float(item["pchs_avg_pric"])
             cur_price = float(item["prpr"])
-            eval_amt = int(qty * cur_price)
-            invest_amt = int(qty * avg_price)
-            profit = eval_amt - invest_amt
-            rate = (profit / invest_amt * 100) if invest_amt else 0.0
+            eval_amt = int(item["evlu_amt"])  # 평가금액
+            profit = int(item["evlu_erng_amt"])  # 수익금
+            rate = float(item["evlu_pfls_rt"])  # 수익률
             investor_flow = get_market_summary(token, code)
 
             new_holdings[name] = qty
@@ -185,7 +184,7 @@ def get_account_profit(only_changes=True):
 
             total_profit += profit
             total_eval += eval_amt
-            total_invest += invest_amt
+            total_invest += qty * avg_price
 
             old_qty = last.get(name, 0)
             if qty != old_qty:
@@ -222,6 +221,7 @@ def get_account_profit(only_changes=True):
     total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
+
 
 last_status_report_hour = None
 HOLIDAYS = ["2024-01-01", "2024-02-09", "2024-02-12", "2024-03-01", "2024-05-01", "2024-05-05", "2024-05-06", "2024-06-06", "2024-08-15", "2024-09-16", "2024-09-17", "2024-09-18", "2024-10-03", "2024-10-09", "2024-12-25"]
