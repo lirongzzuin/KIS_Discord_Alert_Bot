@@ -248,6 +248,60 @@ def get_account_profit(only_changes=True):
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
 
+def get_realized_profit_2025():
+    token = get_kis_access_token()
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+    headers = {
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "TTTC8001R",  # 실전계좌
+        "Content-Type": "application/json"
+    }
+
+    start_dt = "20250101"
+    end_dt = datetime.now().strftime("%Y%m%d")
+    total_realized_profit = 0
+
+    params = {
+        "CANO": KIS_ACCOUNT_NO[:8],
+        "ACNT_PRDT_CD": KIS_ACCOUNT_NO[9:],
+        "INQR_STRT_DT": start_dt,
+        "INQR_END_DT": end_dt,
+        "SLL_BUY_DVSN_CD": "00",  # 전체: 00, 매도: 01, 매수: 02
+        "INQR_DVSN": "01",  # 조회 구분: 역순 01, 정순 02
+        "PDNO": "",         # 종목코드(없으면 전체)
+        "CCLD_DVSN": "00",  # 체결 구분: 전체
+        "ORD_GNO_BRNO": "",
+        "ODNO": "",
+        "INQR_DVSN_3": "00", 
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": ""
+    }
+
+    res = requests.get(url, headers=headers, params=params).json()
+    if res.get("rt_cd") != "0":
+        raise Exception(f"[실현손익 API 실패] {res}")
+
+    for item in res.get("output1", []):
+        # 매도체결만 추출하여 실현손익 계산
+        if item["sll_buy_dvsn_cd"] == "01":  # 매도
+            sell_amt = safe_int(item.get("cntr_amt"))  # 매도금액
+            buy_amt = safe_int(item.get("pchs_amt"))   # 매입금액
+            profit = sell_amt - buy_amt
+            total_realized_profit += profit
+
+    return total_realized_profit
+
+def get_account_profit_with_yearly_report():
+    main_report = get_account_profit(False)
+    try:
+        yearly_profit = get_realized_profit_2025()
+        yearly_summary = f"\n📅 [2025 누적 리포트]\n💵 실현 수익금: {yearly_profit:,}원"
+    except Exception as e:
+        yearly_summary = f"\n📅 [2025 누적 리포트]\n❌ 누적 수익 조회 실패: {e}"
+    return main_report + yearly_summary
+
 last_status_report_hour = None
 HOLIDAYS = ["2024-01-01", "2024-02-09", "2024-02-12", "2024-03-01", "2024-05-01", "2024-05-05", "2024-05-06", "2024-06-06", "2024-08-15", "2024-09-16", "2024-09-17", "2024-09-18", "2024-10-03", "2024-10-09", "2024-12-25"]
 
@@ -287,7 +341,8 @@ def run():
     schedule.every().day.at("09:30").do(lambda: send_alert_message(get_account_profit(False)))
     schedule.every().day.at("13:30").do(lambda: send_alert_message(get_account_profit(False)))
     schedule.every().day.at("15:30").do(lambda: send_alert_message(get_account_profit(False)))
-    schedule.every().day.at("16:00").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("16:00").do(lambda: send_alert_message(get_account_profit_with_yearly_report()))
+
 
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
