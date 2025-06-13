@@ -136,6 +136,8 @@ def safe_float(val):
 
 def get_account_profit(only_changes=True):
     token = get_kis_access_token()
+    realized_holdings = get_realized_holdings_data()
+
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
     headers = {
         "authorization": f"Bearer {token}",
@@ -160,7 +162,7 @@ def get_account_profit(only_changes=True):
     res = requests.get(url, headers=headers, params=params).json()
 
     if res.get("rt_cd") != "0":
-        raise Exception(f"API 응답 실패: {res}")
+        raise Exception(f"[잔고 API 실패] {res}")
 
     output = res.get("output1", [])
     if not output:
@@ -189,7 +191,6 @@ def get_account_profit(only_changes=True):
             profit = safe_int(item.get("evlu_erng_amt"))
             rate = safe_float(item.get("evlu_pfls_rt"))
 
-            # Fallback: 수익금, 수익률 직접 계산 (API값이 0일 경우)
             if eval_amt == 0:
                 eval_amt = int(qty * cur_price)
             if profit == 0:
@@ -214,7 +215,7 @@ def get_account_profit(only_changes=True):
             if qty != old_qty:
                 diff = qty - old_qty
                 arrow = "🟢 증가" if diff > 0 else "🔴 감소"
-                realized = abs(diff) * (cur_price - avg_price)
+                realized = realized_holdings.get(name, abs(diff) * (cur_price - avg_price))
                 changes.append(
                     f"{name} 수량 {arrow}: {old_qty} → {qty}주\n"
                     f"┗ 수익금: {profit:,}원 | 수익률: {rate:.2f}%"
@@ -247,6 +248,49 @@ def get_account_profit(only_changes=True):
     total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
+
+def get_realized_holdings_data():
+    token = get_kis_access_token()
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance-rlz-pl"
+
+    headers = {
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "TTTC8494R",
+        "custtype": "P",  # 개인
+        "Content-Type": "application/json"
+    }
+
+    acct_raw = KIS_ACCOUNT_NO.replace("-", "")
+    cano, acct_cd = acct_raw[:8], acct_raw[8:]
+
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acct_cd,
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "00",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
+        "FNCG_AMT_AUTO_RDPT_YN": "N",
+        "PRCS_DVSN": "00",
+        "COST_ICLD_YN": "N",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": ""
+    }
+
+    res = requests.get(url, headers=headers, params=params).json()
+    if res.get("rt_cd") != "0":
+        raise Exception(f"[실현손익 API 실패] {res}")
+
+    output1 = res.get("output1", [])
+    result = {}
+    for item in output1:
+        name = item.get("prdt_name", "")
+        realized_profit = safe_int(item.get("evlu_pfls_amt"))
+        result[name] = realized_profit
+    return result
 
 def get_yearly_realized_profit_2025():
     token = get_kis_access_token()

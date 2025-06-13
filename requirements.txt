@@ -3,4 +3,3 @@ python-dotenv
 redis
 schedule
 pytz
-pandas
