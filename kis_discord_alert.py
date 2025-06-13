@@ -248,59 +248,55 @@ def get_account_profit(only_changes=True):
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
     return report
 
-def get_realized_profit_2025():
+def get_yearly_realized_profit_2025():
     token = get_kis_access_token()
-    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-period-trade-profit"
+
     headers = {
         "authorization": f"Bearer {token}",
         "appkey": KIS_APP_KEY,
         "appsecret": KIS_APP_SECRET,
-        "tr_id": "TTTC8001R",  # 실전계좌
+        "tr_id": "TTTC8715R",
+        "custtype": "P",  # 개인 고객
         "Content-Type": "application/json"
     }
 
+    acct_raw = KIS_ACCOUNT_NO.replace("-", "")
+    cano, acct_cd = acct_raw[:8], acct_raw[8:]
     start_dt = "20250101"
     end_dt = datetime.now().strftime("%Y%m%d")
-    total_realized_profit = 0
 
     params = {
-        "CANO": KIS_ACCOUNT_NO[:8],
-        "ACNT_PRDT_CD": KIS_ACCOUNT_NO[9:],
+        "CANO": cano,
+        "ACNT_PRDT_CD": acct_cd,
+        "SORT_DVSN": "01",         # 과거순
+        "PDNO": "",                # 전체 종목
         "INQR_STRT_DT": start_dt,
         "INQR_END_DT": end_dt,
-        "SLL_BUY_DVSN_CD": "00",  # 전체: 00, 매도: 01, 매수: 02
-        "INQR_DVSN": "01",  # 조회 구분: 역순 01, 정순 02
-        "PDNO": "",         # 종목코드(없으면 전체)
-        "CCLD_DVSN": "00",  # 체결 구분: 전체
-        "ORD_GNO_BRNO": "",
-        "ODNO": "",
-        "INQR_DVSN_3": "00", 
-        "CTX_AREA_FK100": "",
+        "CBLC_DVSN": "00",         # 전체
+        "CTX_AREA_FK100": "",      # 최초조회
         "CTX_AREA_NK100": ""
     }
 
     res = requests.get(url, headers=headers, params=params).json()
+
     if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익 API 실패] {res}")
+        raise Exception(f"[실현손익조회 실패] {res}")
 
-    for item in res.get("output1", []):
-        # 매도체결만 추출하여 실현손익 계산
-        if item["sll_buy_dvsn_cd"] == "01":  # 매도
-            sell_amt = safe_int(item.get("cntr_amt"))  # 매도금액
-            buy_amt = safe_int(item.get("pchs_amt"))   # 매입금액
-            profit = sell_amt - buy_amt
-            total_realized_profit += profit
+    output2 = res.get("output2", {})
+    realized_profit = safe_int(output2.get("tot_rlzt_pfls", "0"))
+    realized_rate = safe_float(output2.get("tot_pftrt", "0"))
 
-    return total_realized_profit
+    return realized_profit, realized_rate
 
 def get_account_profit_with_yearly_report():
     main_report = get_account_profit(False)
     try:
-        yearly_profit = get_realized_profit_2025()
-        yearly_summary = f"\n📅 [2025 누적 리포트]\n💵 실현 수익금: {yearly_profit:,}원"
+        profit, rate = get_yearly_realized_profit_2025()
+        yearly = f"\n\n📅 [2025 누적 리포트]\n💵 실현 수익금: {profit:,}원\n📈 누적 수익률: {rate:.2f}%"
     except Exception as e:
-        yearly_summary = f"\n📅 [2025 누적 리포트]\n❌ 누적 수익 조회 실패: {e}"
-    return main_report + yearly_summary
+        yearly = f"\n📅 [2025 누적 리포트]\n❌ 누적 수익 조회 실패: {e}"
+    return main_report + yearly
 
 last_status_report_hour = None
 HOLIDAYS = ["2024-01-01", "2024-02-09", "2024-02-12", "2024-03-01", "2024-05-01", "2024-05-05", "2024-05-06", "2024-06-06", "2024-08-15", "2024-09-16", "2024-09-17", "2024-09-18", "2024-10-03", "2024-10-09", "2024-12-25"]
@@ -332,7 +328,8 @@ def check_holdings_change_loop():
 def run():
     send_alert_message("✅ 체결/수익률 알림 봇이 시작되었습니다.")
     try:
-        send_alert_message(get_account_profit(only_changes=False))
+        # send_alert_message(get_account_profit(only_changes=False))
+        send_alert_message(get_account_profit_with_yearly_report())
     except Exception as e:
         send_alert_message(f"❌ 리포트 오류: {e}")
         traceback.print_exc()
