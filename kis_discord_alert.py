@@ -372,17 +372,24 @@ def check_holdings_change_loop():
 def run():
     send_alert_message("✅ 체결/수익률 알림 봇이 시작되었습니다.")
     try:
-        # send_alert_message(get_account_profit(only_changes=False))
-        send_alert_message(get_account_profit_with_yearly_report())
+        # 전체 리포트 대신 누적 수익 정보만 표시
+        profit, rate = get_yearly_realized_profit_2025()
+        summary = (
+            "📅 [2025 누적 리포트]\n"
+            f"💵 실현 수익금: {profit:,}원\n"
+            f"📈 누적 수익률: {rate:.2f}%"
+        )
+        send_alert_message(summary)
     except Exception as e:
-        send_alert_message(f"❌ 리포트 오류: {e}")
+        send_alert_message(f"❌ 누적 리포트 조회 실패: {e}")
         traceback.print_exc()
 
-    schedule.every().day.at("08:30").do(lambda: send_alert_message(get_account_profit(False)))
-    schedule.every().day.at("09:30").do(lambda: send_alert_message(get_account_profit(False)))
-    schedule.every().day.at("13:30").do(lambda: send_alert_message(get_account_profit(False)))
-    schedule.every().day.at("15:30").do(lambda: send_alert_message(get_account_profit(False)))
-    schedule.every().day.at("16:00").do(lambda: send_alert_message(get_account_profit_with_yearly_report()))
+    # schedule.every().day.at("09:30").do(lambda: send_alert_message(get_account_profit(False)))
+    # schedule.every().day.at("13:30").do(lambda: send_alert_message(get_account_profit(False)))
+    # schedule.every().day.at("15:30").do(lambda: send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
+
 
 
     Thread(target=check_holdings_change_loop, daemon=True).start()
