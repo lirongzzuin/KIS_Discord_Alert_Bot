@@ -134,6 +134,85 @@ def safe_float(val):
     except:
         return 0.0
 
+def get_current_cash_balance(token):
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-psbl-order"
+    headers = {
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "TTTC8908R",
+        "Content-Type": "application/json"
+    }
+
+    acct_raw = KIS_ACCOUNT_NO.replace("-", "")
+    cano, acct_cd = acct_raw[:8], acct_raw[8:]
+
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acct_cd,
+        "PDNO": "",
+        "ORD_UNPR": "0",
+        "ORD_DVSN": "00",
+        "CMA_EVLU_AMT_ICLD_YN": "N",
+        "OVRS_ICLD_YN": "N" # 추가: 해외주식포함여부 (N으로 설정)
+    }
+
+    res = requests.get(url, headers=headers, params=params).json()
+    if res.get("rt_cd") != "0":
+        # 오류 메시지를 더 자세히 출력하여 디버깅에 도움을 줍니다.
+        raise Exception(f"[현금 조회 실패] {res.get('msg1', res)}")
+
+    output = res.get("output", {})
+    return safe_int(output.get("dnca_tot_amt", "0"))
+
+def get_initial_assets_2025():
+    try:
+        val = r.get("INITIAL_ASSETS_2025") if r else None
+        return int(val) if val else None # 값이 없거나 비어있으면 None 반환
+    except Exception as e:
+        print(f"[초기 자산 조회 오류] {e}")
+        return None # 오류 발생 시에도 None 반환
+
+def get_net_deposit_2025(token):
+    url = "https://openapi.koreainvestment.com:9443/uapi/overseas-stock/v1/trading/inquire-deposit-withdraw"
+    headers = {
+        "authorization": f"Bearer {token}",
+        "appkey": KIS_APP_KEY,
+        "appsecret": KIS_APP_SECRET,
+        "tr_id": "TTTC8991R",
+        "Content-Type": "application/json"
+    }
+
+    acct_raw = KIS_ACCOUNT_NO.replace("-", "")
+    cano, acct_cd = acct_raw[:8], acct_raw[8:]
+
+    params = {
+        "CANO": cano,
+        "ACNT_PRDT_CD": acct_cd,
+        "INQR_STRT_DT": "20250101",
+        "INQR_END_DT": datetime.now().strftime("%Y%m%d"),
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
+        "INQR_DVSN": "00"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, params=params).json()
+        if res.get("rt_cd") != "0":
+            raise Exception(f"[입출금내역 조회 실패] {res.get('msg1', res)}")
+        deposits = withdrawals = 0
+        for row in res.get("output", []):
+            typ = row.get("dpst_withdraw_gb", "")
+            amt = safe_int(row.get("txamt", "0"))
+            if "입금" in typ:
+                deposits += amt
+            elif "출금" in typ:
+                withdrawals += amt
+        return deposits - withdrawals
+    except Exception as e:
+        print(f"[순입금액 계산 오류] {e}")
+        return 0
+
 def get_account_profit(only_changes=True):
     token = get_kis_access_token()
     realized_holdings = get_realized_holdings_data()
@@ -162,7 +241,7 @@ def get_account_profit(only_changes=True):
     res = requests.get(url, headers=headers, params=params).json()
 
     if res.get("rt_cd") != "0":
-        raise Exception(f"[잔고 API 실패] {res}")
+        raise Exception(f"[잔고 API 실패] {res.get('msg1', res)}")
 
     output = res.get("output1", [])
     if not output:
@@ -215,11 +294,14 @@ def get_account_profit(only_changes=True):
             if qty != old_qty:
                 diff = qty - old_qty
                 arrow = "🟢 증가" if diff > 0 else "🔴 감소"
-                realized = realized_holdings.get(name, abs(diff) * (cur_price - avg_price))
+                # 매도 추정 수익 계산 로직 수정: 매도 시점에 실제 실현 손익을 반영하도록
+                # 이 부분은 KIS API의 실현 손익 데이터를 활용하는 get_realized_holdings_data 함수와 연계하여 더 정확하게 계산할 수 있습니다.
+                # 현재는 단순히 매도 수량 * (현재가 - 평균단가)로 추정합니다.
+                realized_est = abs(diff) * (cur_price - avg_price) if diff < 0 else 0
                 changes.append(
                     f"{name} 수량 {arrow}: {old_qty} → {qty}주\n"
                     f"┗ 수익금: {profit:,}원 | 수익률: {rate:.2f}%"
-                    + (f"\n┗ 매도 추정 수익: {int(realized):,}원" if diff < 0 else "")
+                    + (f"\n┗ 매도 추정 수익: {int(realized_est):,}원" if diff < 0 else "")
                 )
         except Exception as e:
             print(f"[파싱 오류] {e}")
@@ -247,6 +329,36 @@ def get_account_profit(only_changes=True):
 
     total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
     report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
+
+    # 2025 추정 수익률 계산
+    try:
+        cash = get_current_cash_balance(token)
+        initial_assets = get_initial_assets_2025()
+        net_deposit = get_net_deposit_2025(token)
+
+        current_total_assets = total_eval + cash
+
+        if initial_assets is None:
+            # INITIAL_ASSETS_2025 값이 설정되지 않았을 때 안내 메시지
+            report += f"\n\n⚠️ 2025년 추정 수익률 계산을 위해 'INITIAL_ASSETS_2025' 값을 설정해야 합니다."
+            report += f"\n   (예: Redis에 'SET INITIAL_ASSETS_2025 {current_total_assets}' 명령어로 현재 총 자산({current_total_assets:,}원)을 초기 자산으로 설정할 수 있습니다.)"
+        else:
+            # 현재 총 자산 - 초기 자산 - 순입금액 = 추정 수익
+            estimated_profit_2025 = current_total_assets - initial_assets - net_deposit
+            estimated_rate_2025 = 0.0
+            if initial_assets + net_deposit != 0: # 0으로 나누는 오류 방지
+                estimated_rate_2025 = (estimated_profit_2025 / (initial_assets + net_deposit)) * 100
+            elif estimated_profit_2025 != 0: # 초기 자산+순입금액이 0인데 수익이 있다면 무한대
+                estimated_rate_2025 = float('inf') if estimated_profit_2025 > 0 else float('-inf')
+
+            report += f"\n\n📅 2025 추정 수익: {int(estimated_profit_2025):,}원"
+            report += f"\n📅 2025 추정 수익률: {estimated_rate_2025:.2f}%"
+            if initial_assets == 0 and current_total_assets > 0:
+                report += f"\n   (참고: 'INITIAL_ASSETS_2025' 값이 0으로 설정되어 있어 추정 수익률이 정확하지 않을 수 있습니다. 위 안내를 참고하여 설정해주세요.)"
+
+    except Exception as e:
+        report += f"\n📅 2025 추정 수익률 계산 오류: {e}"
+
     return report
 
 def get_realized_holdings_data():
@@ -282,7 +394,7 @@ def get_realized_holdings_data():
 
     res = requests.get(url, headers=headers, params=params).json()
     if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익 API 실패] {res}")
+        raise Exception(f"[실현손익 API 실패] {res.get('msg1', res)}")
 
     output1 = res.get("output1", [])
     result = {}
@@ -325,7 +437,7 @@ def get_yearly_realized_profit_2025():
     res = requests.get(url, headers=headers, params=params).json()
 
     if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익조회 실패] {res}")
+        raise Exception(f"[실현손익조회 실패] {res.get('msg1', res)}")
 
     output2 = res.get("output2", {})
     realized_profit = safe_int(output2.get("tot_rlzt_pfls", "0"))
@@ -337,9 +449,13 @@ def get_account_profit_with_yearly_report():
     main_report = get_account_profit(False)
     try:
         profit, rate = get_yearly_realized_profit_2025()
-        yearly = f"\n\n📅 [2025 누적 리포트]\n💵 실현 수익금: {profit:,}원\n📈 누적 수익률: {rate:.2f}%"
+        yearly = (
+            "\n\n📅 [2025 누적 리포트 (실현 손익 기준)]\n"
+            f"💵 실현 수익금: {profit:,}원\n"
+            f"📈 누적 수익률: {rate:.2f}%"
+        )
     except Exception as e:
-        yearly = f"\n📅 [2025 누적 리포트]\n❌ 누적 수익 조회 실패: {e}"
+        yearly = f"\n📅 [2025 누적 리포트 (실현 손익 기준)]\n❌ 누적 수익 조회 실패: {e}"
     return main_report + yearly
 
 last_status_report_hour = None
@@ -357,13 +473,9 @@ def check_holdings_change_loop():
     while True:
         try:
             if is_trading_day() and is_market_hour():
-                now = datetime.now(timezone('Asia/Seoul'))
-                report = get_account_profit(only_changes=True if only_changes else False)
+                report = get_account_profit(only_changes=True)
                 if report:
                     send_alert_message(report)
-                elif now.minute == 0 and now.hour % 2 == 1 and now.hour != last_status_report_hour:
-                    send_alert_message(get_account_profit(only_changes=False))
-                    last_status_report_hour = now.hour
         except Exception as e:
             send_alert_message(f"❌ 자동 잔고 체크 오류: {e}")
             traceback.print_exc()
@@ -372,10 +484,10 @@ def check_holdings_change_loop():
 def run():
     send_alert_message("✅ 체결/수익률 알림 봇이 시작되었습니다.")
     try:
-        # 전체 리포트 대신 누적 수익 정보만 표시
+        # 봇 시작 시 2025년 누적 리포트 (실현 손익 기준)를 먼저 보냅니다.
         profit, rate = get_yearly_realized_profit_2025()
         summary = (
-            "📅 [2025 누적 리포트]\n"
+            "📅 [2025 누적 리포트 (실현 손익 기준)]\n"
             f"💵 실현 수익금: {profit:,}원\n"
             f"📈 누적 수익률: {rate:.2f}%"
         )
@@ -384,13 +496,8 @@ def run():
         send_alert_message(f"❌ 누적 리포트 조회 실패: {e}")
         traceback.print_exc()
 
-    # schedule.every().day.at("09:30").do(lambda: send_alert_message(get_account_profit(False)))
-    # schedule.every().day.at("13:30").do(lambda: send_alert_message(get_account_profit(False)))
-    # schedule.every().day.at("15:30").do(lambda: send_alert_message(get_account_profit(False)))
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit(False)))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-
-
 
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
