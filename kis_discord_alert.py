@@ -370,7 +370,7 @@ def get_realized_holdings_data():
         "appkey": KIS_APP_KEY,
         "appsecret": KIS_APP_SECRET,
         "tr_id": "TTTC8494R",
-        "custtype": "P",  # 개인
+        "custtype": "P",
         "Content-Type": "application/json"
     }
 
@@ -392,11 +392,19 @@ def get_realized_holdings_data():
         "CTX_AREA_NK100": ""
     }
 
-    res = requests.get(url, headers=headers, params=params).json()
-    if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익 API 실패] {res.get('msg1', res)}")
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res.raise_for_status()  # 네트워크 오류 처리
+        data = res.json()
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"[실현손익 API 네트워크 오류] {e}")
+    except ValueError:
+        raise Exception("[실현손익 API 응답 오류] JSON 포맷이 아님 또는 응답이 없음")
 
-    output1 = res.get("output1", [])
+    if data.get("rt_cd") != "0":
+        raise Exception(f"[실현손익 API 실패] {data.get('msg1', data)}")
+
+    output1 = data.get("output1", [])
     result = {}
     for item in output1:
         name = item.get("prdt_name", "")
