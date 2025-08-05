@@ -173,7 +173,12 @@ def get_initial_assets_2025():
         print(f"[초기 자산 조회 오류] {e}")
         return None # 오류 발생 시에도 None 반환
 
-def get_net_deposit_2025(token):
+def get_net_deposit_2025(token, retries=2, timeout=10, sleep_sec=0.4):
+    """
+    2025-01-01~오늘까지 순입금액(입금-출금) 계산.
+    - 네트워크/빈본문/비JSON 응답/페이지네이션을 견고하게 처리
+    - 실패 시 예외를 발생시키고, 호출부에서 try/except로 0 처리 유지 권장
+    """
     url = "https://openapi.koreainvestment.com:9443/uapi/overseas-stock/v1/trading/inquire-deposit-withdraw"
     headers = {
         "authorization": f"Bearer {token}",
@@ -196,22 +201,76 @@ def get_net_deposit_2025(token):
         "INQR_DVSN": "00"
     }
 
-    try:
-        res = requests.get(url, headers=headers, params=params).json()
-        if res.get("rt_cd") != "0":
-            raise Exception(f"[입출금내역 조회 실패] {res.get('msg1', res)}")
-        deposits = withdrawals = 0
-        for row in res.get("output", []):
-            typ = row.get("dpst_withdraw_gb", "")
-            amt = safe_int(row.get("txamt", "0"))
-            if "입금" in typ:
-                deposits += amt
-            elif "출금" in typ:
-                withdrawals += amt
-        return deposits - withdrawals
-    except Exception as e:
-        print(f"[순입금액 계산 오류] {e}")
-        return 0
+    deposits = 0
+    withdrawals = 0
+
+    while True:
+        attempt = 0
+        last_err = None
+
+        # 재시도 루프
+        while attempt <= retries:
+            try:
+                resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+                # HTTP 오류
+                if resp.status_code != 200:
+                    last_err = f"HTTP {resp.status_code} / {resp.text[:200]}"
+                    attempt += 1
+                    time.sleep(sleep_sec)
+                    continue
+
+                txt = (resp.text or "").strip()
+                # 빈 본문
+                if not txt:
+                    last_err = "empty body"
+                    attempt += 1
+                    time.sleep(sleep_sec)
+                    continue
+
+                # JSON 파싱
+                try:
+                    data = resp.json()
+                except ValueError as ve:
+                    last_err = f"invalid json: {str(ve)} / body[:200]={txt[:200]}"
+                    attempt += 1
+                    time.sleep(sleep_sec)
+                    continue
+
+                # KIS 결과 코드 확인
+                if data.get("rt_cd") != "0":
+                    # 메시지 포함
+                    msg = data.get("msg1") or data.get("msg_cd") or str(data)[:200]
+                    raise Exception(f"[입출금내역 조회 실패] {msg}")
+
+                # 정상 처리
+                for row in data.get("output", []):
+                    typ = (row.get("dpst_withdraw_gb") or "").strip()
+                    amt = safe_int(row.get("txamt", "0"))
+                    if "입금" in typ:
+                        deposits += amt
+                    elif "출금" in typ:
+                        withdrawals += amt
+
+                # 페이지네이션
+                fk = (data.get("CTX_AREA_FK100") or "").strip()
+                nk = (data.get("CTX_AREA_NK100") or "").strip()
+                if fk or nk:
+                    params["CTX_AREA_FK100"] = fk
+                    params["CTX_AREA_NK100"] = nk
+                    time.sleep(sleep_sec)  # 과호출 방지
+                    break  # 다음 페이지를 위해 상위 while True 계속
+                else:
+                    # 더 없음, 종료
+                    return deposits - withdrawals
+
+            except requests.exceptions.RequestException as e:
+                last_err = f"network: {e}"
+                attempt += 1
+                time.sleep(sleep_sec)
+                continue
+
+        # 재시도 모두 실패
+        raise Exception(f"[순입금액 계산 오류] {last_err}")
 
 def get_account_profit(only_changes=True):
     token = get_kis_access_token()
@@ -252,7 +311,9 @@ def get_account_profit(only_changes=True):
 
     new_holdings = {}
     parsed_items = []
-    total_profit = total_eval = total_invest = 0
+    total_profit = 0          # 종목 합계 평가손익
+    total_eval = 0            # 종목 합계 평가금액
+    total_invest = 0          # 종목 합계 매수원금(= 수량 * 평단)
     changes = []
 
     for item in output:
@@ -272,11 +333,12 @@ def get_account_profit(only_changes=True):
 
             if eval_amt == 0:
                 eval_amt = int(qty * cur_price)
+
+            invest_amt = int(qty * avg_price)
             if profit == 0:
-                invest_amt = int(qty * avg_price)
                 profit = eval_amt - invest_amt
             if rate == 0 and avg_price > 0:
-                rate = (profit / (qty * avg_price)) * 100
+                rate = (profit / invest_amt) * 100
 
             investor_flow = get_market_summary(token, code)
 
@@ -288,15 +350,12 @@ def get_account_profit(only_changes=True):
 
             total_profit += profit
             total_eval += eval_amt
-            total_invest += qty * avg_price
+            total_invest += invest_amt
 
             old_qty = last.get(name, 0)
             if qty != old_qty:
                 diff = qty - old_qty
                 arrow = "🟢 증가" if diff > 0 else "🔴 감소"
-                # 매도 추정 수익 계산 로직 수정: 매도 시점에 실제 실현 손익을 반영하도록
-                # 이 부분은 KIS API의 실현 손익 데이터를 활용하는 get_realized_holdings_data 함수와 연계하여 더 정확하게 계산할 수 있습니다.
-                # 현재는 단순히 매도 수량 * (현재가 - 평균단가)로 추정합니다.
                 realized_est = abs(diff) * (cur_price - avg_price) if diff < 0 else 0
                 changes.append(
                     f"{name} 수량 {arrow}: {old_qty} → {qty}주\n"
@@ -315,6 +374,27 @@ def get_account_profit(only_changes=True):
     if only_changes:
         return "📌 [잔고 변동 내역]\n" + "\n".join(changes) if changes else ""
 
+    # --------- 여기서부터 하단 합계 계산 로직 수정(예수금 더하고, 순입금 차감) ---------
+    # 예수금(현금) 조회 실패 시 0으로 처리
+    try:
+        cash = get_current_cash_balance(token)
+    except Exception as e:
+        print(f"[예수금 조회 실패] {e}")
+        cash = 0
+
+    # 2025년 순입금액(입금-출금) 조회 실패 시 0으로 처리
+    try:
+        net_deposit = get_net_deposit_2025(token)
+    except Exception as e:
+        print(f"[순입금 조회 실패] {e}")
+        net_deposit = 0
+
+    total_assets = total_eval + cash                     # 평가 + 현금
+    display_total_eval = total_assets - net_deposit      # 표시용 총 평가금액(요청사항 반영)
+    display_total_profit = (total_assets - net_deposit) - total_invest
+    display_total_rate = (display_total_profit / total_invest * 100) if total_invest else 0.0
+    # -------------------------------------------------------------------------------
+
     report = ""
     if changes:
         report += "📌 [잔고 변동 내역]\n" + "\n".join(changes) + "\n\n"
@@ -327,35 +407,34 @@ def get_account_profit(only_changes=True):
         if item["flow"]:
             report += f"\n┗ {item['flow']}"
 
-    total_rate = (total_profit / total_invest * 100) if total_invest else 0.0
-    report += f"\n\n📈 총 평가금액: {total_eval:,}원\n💰 총 수익금: {total_profit:,}원\n📉 총 수익률: {total_rate:.2f}%"
+    # 하단 합계(요청 반영 버전)
+    report += (
+        f"\n\n📈 총 평가금액: {int(display_total_eval):,}원"
+        f"\n💰 총 수익금: {int(display_total_profit):,}원"
+        f"\n📉 총 수익률: {display_total_rate:.2f}%"
+    )
 
-    # 2025 추정 수익률 계산
+    # 2025 추정 수익률 블록(기존 로직 유지)
     try:
-        cash = get_current_cash_balance(token)
         initial_assets = get_initial_assets_2025()
-        net_deposit = get_net_deposit_2025(token)
-
-        current_total_assets = total_eval + cash
-
+        current_total_assets = total_assets  # 평가+현금
         if initial_assets is None:
-            # INITIAL_ASSETS_2025 값이 설정되지 않았을 때 안내 메시지
-            report += f"\n\n⚠️ 2025년 추정 수익률 계산을 위해 'INITIAL_ASSETS_2025' 값을 설정해야 합니다."
-            report += f"\n   (예: Redis에 'SET INITIAL_ASSETS_2025 {current_total_assets}' 명령어로 현재 총 자산({current_total_assets:,}원)을 초기 자산으로 설정할 수 있습니다.)"
+            report += (
+                f"\n\n⚠️ 2025년 추정 수익률 계산을 위해 'INITIAL_ASSETS_2025' 값을 설정해야 합니다."
+                f"\n   (예: Redis에 'SET INITIAL_ASSETS_2025 {current_total_assets:,}' 로 현재 총 자산을 초기 자산으로 설정)"
+            )
         else:
-            # 현재 총 자산 - 초기 자산 - 순입금액 = 추정 수익
             estimated_profit_2025 = current_total_assets - initial_assets - net_deposit
-            estimated_rate_2025 = 0.0
-            if initial_assets + net_deposit != 0: # 0으로 나누는 오류 방지
-                estimated_rate_2025 = (estimated_profit_2025 / (initial_assets + net_deposit)) * 100
-            elif estimated_profit_2025 != 0: # 초기 자산+순입금액이 0인데 수익이 있다면 무한대
-                estimated_rate_2025 = float('inf') if estimated_profit_2025 > 0 else float('-inf')
+            denom = (initial_assets + net_deposit)
+            if denom != 0:
+                estimated_rate_2025 = (estimated_profit_2025 / denom) * 100
+            else:
+                estimated_rate_2025 = float('inf') if estimated_profit_2025 > 0 else float('-inf') if estimated_profit_2025 < 0 else 0.0
 
-            report += f"\n\n📅 2025 추정 수익: {int(estimated_profit_2025):,}원"
-            report += f"\n📅 2025 추정 수익률: {estimated_rate_2025:.2f}%"
-            if initial_assets == 0 and current_total_assets > 0:
-                report += f"\n   (참고: 'INITIAL_ASSETS_2025' 값이 0으로 설정되어 있어 추정 수익률이 정확하지 않을 수 있습니다. 위 안내를 참고하여 설정해주세요.)"
-
+            report += (
+                f"\n\n📅 2025 추정 수익: {int(estimated_profit_2025):,}원"
+                f"\n📅 2025 추정 수익률: {estimated_rate_2025:.2f}%"
+            )
     except Exception as e:
         report += f"\n📅 2025 추정 수익률 계산 오류: {e}"
 
