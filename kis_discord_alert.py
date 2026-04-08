@@ -748,7 +748,7 @@ def get_account_profit(only_changes=True):
         report += f"\n┗ 해외: {_fmt_amount_won(ovrs_eval)}"
     report += (
         f"\n┗ {kr_pl_icon} 보유 평가손익: {kr_pl_total:,}원 ({kr_pl_rate:+.2f}%)"
-        f"\n┗ {day_icon} 전일 대비: {day_change:,}원"
+        f"\n┗ {day_icon} 전일 대비: {day_change:+,}원"
     )
 
     # ── 실현손익 (매도 확정, KIS API TTTC8715R) ──
@@ -1198,6 +1198,50 @@ def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> s
         lines.append(f"{rank}. {name} ({code}) | 점수: {score:,}\n   일별순매수: [{lastN}]")
     return "\n".join(lines)
 
+def build_daily_top_supply_demand(topn: int = 3) -> str:
+    """당일 외국인/기관 순매수 TOP 종목"""
+    if not is_trading_day():
+        return ""
+    rows = []
+    for market in ("0000", "0001"):
+        # 외국인 순매수 상위 (fid_div_cls=1, fid_rank_sort=0 = 순매수 상위)
+        fetched = _call_foreign_institution_total(fid_input_iscd=market, fid_div_cls="1", fid_rank_sort="0")
+        rows.extend(fetched)
+        time.sleep(0.25)
+
+    if not rows:
+        return ""
+
+    # 외국인 순매수 TOP
+    frgn_list = []
+    for row in rows:
+        code = (row.get("mksc_shrn_iscd") or "").strip()
+        name = row.get("hts_kor_isnm") or row.get("isnm") or code
+        frgn_qty = safe_int(row.get("frgn_ntby_qty"))
+        orgn_qty = safe_int(row.get("orgn_ntby_qty"))
+        if code and frgn_qty != 0:
+            frgn_list.append({"code": code, "name": name, "frgn": frgn_qty, "orgn": orgn_qty})
+
+    if not frgn_list:
+        return ""
+
+    # 외국인 순매수 TOP 3
+    frgn_buy = sorted(frgn_list, key=lambda x: x["frgn"], reverse=True)[:topn]
+    # 기관 순매수 TOP 3
+    orgn_buy = sorted(frgn_list, key=lambda x: x["orgn"], reverse=True)[:topn]
+
+    lines = [f"{'━'*28}", f"📊 [당일 수급 TOP {topn}]"]
+    lines.append(f"\n🌍 외국인 순매수")
+    for i, it in enumerate(frgn_buy, 1):
+        icon = "🟢" if it["frgn"] > 0 else "🔴"
+        lines.append(f"┗ {i}. {icon} {it['name']} | {it['frgn']:+,}주")
+    lines.append(f"\n🏛️ 기관 순매수")
+    for i, it in enumerate(orgn_buy, 1):
+        icon = "🟢" if it["orgn"] > 0 else "🔴"
+        lines.append(f"┗ {i}. {icon} {it['name']} | {it['orgn']:+,}주")
+
+    return "\n".join(lines)
+
 # ================== 알림 작업 ==================
 def _is_first_trading_day_of_month(now_dt: datetime = None) -> bool:
     """이번 달 첫 거래일인지 판별"""
@@ -1281,8 +1325,15 @@ def check_holdings_change_loop():
 
 # ================== 런 ==================
 def get_account_profit_with_yearly_report():
-    """16:00 종합 리포트 — 본문에 이미 누적 수익 포함"""
-    return get_account_profit(False)
+    """16:00 종합 리포트 — 자산현황 + 수급 TOP"""
+    main_report = get_account_profit(False)
+    try:
+        supply = build_daily_top_supply_demand(topn=3)
+        if supply:
+            main_report += "\n\n" + supply
+    except Exception as e:
+        main_report += f"\n\n📊 수급 TOP 조회 오류: {e}"
+    return main_report
 
 def run():
     print(f"[시작] KIS Discord Alert Bot (연도: {current_year()})")
@@ -1300,7 +1351,7 @@ def run():
         send_alert_message(f"❌ 실현손익 조회 실패: {e}")
 
     # 스케줄
-    schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit(False)))
+    schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("08:10").do(job_weekly_etf_briefing)     # 주간 ETF (첫 거래일만)
     schedule.every().day.at("08:10").do(job_monthly_etf_report)     # 월간 ETF (첫 거래일만)

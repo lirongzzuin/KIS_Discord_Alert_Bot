@@ -1,7 +1,7 @@
 # KIS Trading Alert Bot (Discord & Telegram)
 
 한국투자증권 OpenAPI 기반의 실시간 투자 알림 봇.  
-보유 종목 변동, 수익률 리포트, ETF 시장 브리핑, 외국인 수급 추세 등을 Discord + Telegram으로 자동 전송합니다.
+보유 종목 변동, 수익률 리포트, ETF 시장 브리핑, 외국인/기관 수급 등을 Discord + Telegram으로 자동 전송합니다.
 
 ---
 
@@ -14,9 +14,12 @@
 
 ### 종합 리포트 (매일 08:30 / 16:00)
 - 보유 종목별 수익률 + 외국인/기관 수급 요약
-- **총 자산 현황**: 국내 + 해외 + 예수금
-- **총 누적 수익**: 미실현 평가손익 + 전체기간 실현손익 (KIS API 최대 10년)
-- **올해 누적 수익**: 미실현 + 올해 실현손익 (매도 확정 기준)
+- **총 자산**: KIS API `output2` 기반 정확한 총자산 (보유평가 + 예수금)
+- **보유 평가손익**: 투자원금 대비 현재 평가 (매입가 기준)
+- **전일 대비**: 자산 증감
+- **실현손익**: 올해/전체(최대 10년) 매도 확정 수익 (KIS API `TTTC8715R`)
+- **연초 대비 수익률**: Redis 연초 자산 스냅샷 기반 자동 계산
+- **수급 TOP 3**: 당일 외국인/기관 순매수 상위 종목
 
 ### ETF 브리핑
 - **주간** (매주 첫 거래일 08:10): 신규 상장 ETF 감지 + 거래량 TOP 5
@@ -29,10 +32,9 @@
 
 ### 안정성
 - Redis 미사용 시에도 핵심 기능 동작 (스냅샷/캐시 기능만 제한)
-- Discord 2000자 / Telegram 4096자 자동 분할
-- Discord Rate Limit 자동 대응
-- Docker SIGTERM 핸들링 (fly.io graceful shutdown)
-- 한국 공휴일 자동 판별 (`holidays` 패키지)
+- Discord 2000자 / Telegram 4096자 자동 분할 + Rate Limit 대응
+- Docker SIGTERM/SIGINT 핸들링 (fly.io graceful shutdown)
+- 한국 공휴일 자동 판별 (`holidays` 패키지, 연도 하드코딩 없음)
 
 ---
 
@@ -43,10 +45,28 @@
 | 08:10 | 주간 ETF 브리핑 (신규 상장 감지) | 매주 첫 거래일 |
 | 08:10 | 월간 ETF 수익률 리포트 | 매월 첫 거래일 |
 | 08:20 | 외국인 수급 추세 TOP N | 매일 거래일 |
-| 08:30 | 국내 보유 종목 상세 리포트 | 매일 거래일 |
+| 08:30 | 종합 리포트 (보유종목 + 자산 + 수급 TOP) | 매일 거래일 |
 | 15:50 | 외국인 수급 스냅샷 저장 | 매일 거래일 |
-| 16:00 | 종합 리포트 (자산현황 + 누적수익) | 매일 거래일 |
+| 16:00 | 종합 리포트 (보유종목 + 자산 + 실현손익 + 수급 TOP) | 매일 거래일 |
 | 매 60초 | 국내(장중)/해외(24h) 잔고 변동 감지 | 실시간 |
+
+---
+
+## 리포트 예시
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💼 [총 자산] 109,087,723원
+┗ 보유종목: 84,891,300원 (원금: 85,004,612원)
+┗ 예수금: 21,377,053원
+┗ 🔴 보유 평가손익: -113,312원 (-0.13%)
+┗ 🟢 전일 대비: +4,822,655원
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+💰 [실현손익] 매도 확정 수익
+┗ 🟢 2026년 (2026.01.01~04.08): 21,784,321원 (+35.58%)
+┗ 🟢 전체 (2016.04.10~04.08): 24,430,042원 (+7.36%)
+```
 
 ---
 
@@ -72,20 +92,10 @@ KIS_ACCOUNT_NO=12345678-01
 # 알림 채널 (최소 1개 필수)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxxx/xxxx
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=your_chat_id
+TELEGRAM_CHAT_ID=-100xxxxxxxxxx
 
 # Redis (선택 — 스냅샷/캐시/수급추세에 사용)
 REDIS_URL=redis://default:password@host:6379
-
-# 환율 폴백 (선택)
-FALLBACK_USDKRW=1350
-FALLBACK_JPYKRW=9.5
-FALLBACK_HKDKRW=175
-FALLBACK_CNYKRW=190
-FX_CACHE_TTL_SEC=900
-
-# 외국인 추세 TopN (선택)
-FOREIGN_TREND_TOPN=15
 ```
 
 ### 실행
@@ -97,47 +107,29 @@ python kis_discord_alert.py
 
 ## fly.io 배포
 
-### 1. fly.io CLI 설치 및 로그인
 ```bash
-brew install flyctl
-flyctl auth login
-```
-
-### 2. 앱 생성 (최초 1회)
-```bash
-cd KIS_Discord_Alert_Bot
+# 1. 앱 생성
 flyctl apps create kis-discord-alert-bot --org personal
-```
 
-### 3. Redis 생성 (선택)
-```bash
+# 2. Redis 생성 (선택)
 flyctl redis create --name kis-alert-redis --region nrt --no-replicas --enable-eviction -o personal
-```
-- ProdPack 질문에 **No** 선택
-- 출력된 Redis URL 복사
 
-### 4. 시크릿 등록
-```bash
+# 3. 시크릿 등록
 flyctl secrets set \
   KIS_APP_KEY="..." \
   KIS_APP_SECRET="..." \
-  KIS_ACCOUNT_NO="12345678-01" \
-  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..." \
+  KIS_ACCOUNT_NO="..." \
+  DISCORD_WEBHOOK_URL="..." \
   TELEGRAM_BOT_TOKEN="..." \
   TELEGRAM_CHAT_ID="..." \
-  REDIS_URL="redis://..." \
+  REDIS_URL="..." \
   --app kis-discord-alert-bot
-```
 
-### 5. 배포
-```bash
+# 4. 배포
 flyctl deploy
-```
 
-### 6. 확인
-```bash
+# 5. 확인
 flyctl logs --app kis-discord-alert-bot --no-tail | tail -20
-flyctl status --app kis-discord-alert-bot
 ```
 
 ---
@@ -147,26 +139,19 @@ flyctl status --app kis-discord-alert-bot
 ### KIS API 활용
 | API (tr_id) | 용도 |
 |---|---|
-| `TTTC8434R` | 국내 잔고/평가 |
-| `TTTC8494R` | 국내 실현손익 |
-| `TTTC8715R` | 기간별 누적 실현손익 (최대 10년) |
-| `TTTC8908R` | 예수금/주문가능금액 |
+| `TTTC8434R` | 국내 잔고/평가 (output1: 종목별, output2: 계좌요약) |
+| `TTTC8715R` | 기간별 실현손익 (매도 확정, 최대 10년) |
 | `CTRP6504R` | 해외 현재잔고 |
 | `HHDFS00000300` | 환율 조회 |
-| `FHKST01010900` | 외국인/기관 수급 |
-| `FHPTJ04400000` | 외국인/기관 종합 |
+| `FHKST01010900` | 종목별 외국인/기관 수급 |
+| `FHPTJ04400000` | 외국인/기관 순매수 종합 (수급 TOP) |
 
-### 누적 수익 계산 방식
-- **미실현 손익** = 현재 보유 평가금액 - 투자원금 (국내 + 해외)
-- **실현 손익** = KIS API `TTTC8715R` 기간별 조회 (매도 확정)
-- **총 누적** = 미실현 + 전체기간 실현 (최대 10년)
-- **올해 누적** = 미실현 + 올해 실현
-- Redis 의존 없이 KIS API만으로 계산
-
-### ETF 신규 상장 감지
-- 네이버 금융 ETF API에서 전종목 코드 세트를 일일 비교
-- 이전 스냅샷에 없던 코드가 등장하면 신규 상장으로 판별
-- Redis에 스냅샷 저장 (Redis 없으면 감지 불가)
+### 수익 계산 방식
+- **보유 평가손익** = 현재 평가금액 - 매입원금 (KIS output2 `evlu_pfls_smtl_amt`)
+- **실현손익** = 매도 확정 순수익 (KIS `TTTC8715R`, 원금 제외)
+- **올해 실현** = 2026.01.01~ 기간 조회
+- **전체 실현** = 최대 10년 기간 조회 (API 제한)
+- **연초 대비** = Redis 자동 저장된 연초 총자산 vs 현재 총자산
 
 ---
 
