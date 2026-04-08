@@ -689,19 +689,26 @@ def get_account_profit(only_changes=True):
     if only_changes:
         return ("📌 [국내 잔고 변동]\n" + "\n".join(changes)) if changes else ""
 
-    try: cash = get_current_cash_balance(token)
-    except Exception as e: print(f"[예수금 조회 실패] {e}"); cash = 0
-    net_deposit = 0  # 순입금은 KIS 실현손익 API 기반으로 대체됨
+    # output2에서 계좌 요약 추출 (가장 정확한 데이터)
+    acct_summary = res.get("output2", [{}])
+    if isinstance(acct_summary, list) and acct_summary:
+        acct_summary = acct_summary[0]
+    cash = safe_int(acct_summary.get("dnca_tot_amt", "0"))
+    kr_total_assets = safe_int(acct_summary.get("tot_evlu_amt", "0"))  # 총평가(보유+예수금)
+    kr_buy_total = safe_int(acct_summary.get("pchs_amt_smtl_amt", "0"))  # 매입금액 합계
+    kr_eval_total = safe_int(acct_summary.get("evlu_amt_smtl_amt", "0"))  # 평가금액 합계
+    kr_pl_total = safe_int(acct_summary.get("evlu_pfls_smtl_amt", "0"))  # 평가손익 합계
+    prev_total = safe_int(acct_summary.get("bfdy_tot_asst_evlu_amt", "0"))  # 전일 총자산
+    day_change = safe_int(acct_summary.get("asst_icdc_amt", "0"))  # 오늘 자산 증감
 
-    # 해외 평가금액
+    # 해외 평가
     ovrs_eval, ovrs_invest = _get_total_overseas_eval()
+    ovrs_profit = ovrs_eval - ovrs_invest
 
-    # 국내 총자산 = 국내 평가 + 예수금
-    kr_total = total_eval + cash
-    # 전체 총자산 = 국내 + 해외
-    grand_total = kr_total + ovrs_eval
+    # 전체 총자산
+    grand_total = kr_total_assets + ovrs_eval
 
-    # 연초 자산 자동 저장 (Redis 있으면)
+    # 연초 자산 자동 저장
     save_initial_assets_if_needed(int(grand_total))
 
     # ── 보유 종목 리포트 ──
@@ -717,48 +724,34 @@ def get_account_profit(only_changes=True):
             + (f"\n┗ {it['flow']}" if it["flow"] else "")
         )
 
-    # ── 보유 종목 평가손익 (미실현) ──
-    kr_unreal_rate = (total_profit / total_invest * 100) if total_invest else 0.0
-    kr_icon = "🟢" if total_profit >= 0 else "🔴"
-    report += (
-        f"\n\n{'━'*28}"
-        f"\n{kr_icon} 국내 평가손익: {total_profit:,}원 ({kr_unreal_rate:+.2f}%)"
-        f"\n┗ 평가: {total_eval:,}원 / 원금: {total_invest:,}원"
-    )
-
     # 해외 보유 있으면 표시
-    ovrs_profit = ovrs_eval - ovrs_invest
     if ovrs_eval > 0:
         ovrs_rate = (ovrs_profit / ovrs_invest * 100) if ovrs_invest else 0.0
         ov_icon = "🟢" if ovrs_profit >= 0 else "🔴"
         report += (
-            f"\n{ov_icon} 해외 평가손익: {_fmt_amount_won(ovrs_profit)} ({ovrs_rate:+.2f}%)"
+            f"\n\n{ov_icon} 해외 평가손익: {_fmt_amount_won(ovrs_profit)} ({ovrs_rate:+.2f}%)"
             f"\n┗ 평가: {_fmt_amount_won(ovrs_eval)} / 원금: {_fmt_amount_won(ovrs_invest)}"
         )
 
-    # ── 총 자산 ──
+    # ── 총 자산 현황 ──
+    kr_pl_icon = "🟢" if kr_pl_total >= 0 else "🔴"
+    kr_pl_rate = (kr_pl_total / kr_buy_total * 100) if kr_buy_total > 0 else 0.0
+    day_icon = "🟢" if day_change >= 0 else "🔴"
+
     report += (
         f"\n\n{'━'*28}"
         f"\n💼 [총 자산] {int(grand_total):,}원"
-        f"\n┗ 국내 보유: {total_eval:,}원"
+        f"\n┗ 보유종목: {kr_eval_total:,}원 (원금: {kr_buy_total:,}원)"
+        f"\n┗ 예수금: {cash:,}원"
     )
     if ovrs_eval > 0:
-        report += f"\n┗ 해외 보유: {_fmt_amount_won(ovrs_eval)}"
-    if cash > 0:
-        report += f"\n┗ 예수금: {cash:,}원"
-
-    # ── 보유 종목 평가손익 (투자원금 대비 현재가) ──
-    total_unrealized = total_profit + int(ovrs_profit)
-    total_invested = total_invest + ovrs_invest
-    total_eval_all = total_eval + ovrs_eval
-    unreal_rate = (total_unrealized / total_invested * 100) if total_invested > 0 else 0.0
-    ur_icon = "🟢" if total_unrealized >= 0 else "🔴"
+        report += f"\n┗ 해외: {_fmt_amount_won(ovrs_eval)}"
     report += (
-        f"\n\n{ur_icon} [보유 평가손익] {total_unrealized:,}원 ({unreal_rate:+.2f}%)"
-        f"\n┗ 투자원금: {int(total_invested):,}원 → 현재평가: {int(total_eval_all):,}원"
+        f"\n┗ {kr_pl_icon} 보유 평가손익: {kr_pl_total:,}원 ({kr_pl_rate:+.2f}%)"
+        f"\n┗ {day_icon} 전일 대비: {day_change:,}원"
     )
 
-    # ── 실현손익 (매도 확정, KIS API) ──
+    # ── 실현손익 (매도 확정, KIS API TTTC8715R) ──
     now_dt = datetime.now(KST)
     today_str = now_dt.strftime("%Y%m%d")
     year = current_year()
@@ -774,11 +767,23 @@ def get_account_profit(only_changes=True):
         report += (
             f"\n\n{'━'*28}"
             f"\n💰 [실현손익] 매도 확정 수익"
-            f"\n┗ {yr_icon} {year}년 ({year}.01.01~): {year_realized:,}원 ({year_realized_rate:+.2f}%)"
-            f"\n┗ {all_icon} 전체 ({ten_y_dt.strftime('%Y.%m.%d')}~): {all_realized:,}원 ({all_realized_rate:+.2f}%)"
+            f"\n┗ {yr_icon} {year}년 ({year}.01.01~{now_dt.strftime('%m.%d')}): {year_realized:,}원 ({year_realized_rate:+.2f}%)"
+            f"\n┗ {all_icon} 전체 ({ten_y_dt.strftime('%Y.%m.%d')}~{now_dt.strftime('%m.%d')}): {all_realized:,}원 ({all_realized_rate:+.2f}%)"
         )
     except Exception as e:
         report += f"\n\n💰 실현손익 조회 오류: {e}"
+
+    # ── 올해 수익 (연초 자산 대비, Redis 필요) ──
+    initial_assets = get_initial_assets()
+    if initial_assets is not None and initial_assets > 0:
+        ytd_profit = int(grand_total) - initial_assets
+        ytd_rate = (ytd_profit / initial_assets * 100)
+        ytd_icon = "🟢" if ytd_profit >= 0 else "🔴"
+        report += (
+            f"\n\n📅 [{year}년 자산 수익률] {year}.01.01 ~ {now_dt.strftime('%m.%d')}"
+            f"\n┗ 연초: {initial_assets:,}원 → 현재: {int(grand_total):,}원"
+            f"\n┗ {ytd_icon} 변동: {ytd_profit:,}원 ({ytd_rate:+.2f}%)"
+        )
 
     return report
 
