@@ -773,17 +773,31 @@ def get_account_profit(only_changes=True):
     except Exception as e:
         report += f"\n\n💰 실현손익 조회 오류: {e}"
 
-    # ── 올해 수익 (연초 자산 대비, Redis 필요) ──
-    initial_assets = get_initial_assets()
-    if initial_assets is not None and initial_assets > 0:
-        ytd_profit = int(grand_total) - initial_assets
-        ytd_rate = (ytd_profit / initial_assets * 100)
+    # ── 올해 자산 수익률 (KIS API 역산) ──
+    # 연초 추정 자산 = 현재 총자산 - 올해 실현손익 - 현재 미실현 손익
+    try:
+        yr_realized_for_calc, _ = _query_realized_profit_period(token, year_start_date(), today_str)
+        unrealized_now = kr_pl_total + int(ovrs_profit)
+        estimated_initial = int(grand_total) - yr_realized_for_calc - unrealized_now
+
+        # 역산한 연초 자산을 Redis에 저장 (최초 1회)
+        initial_key = f"INITIAL_ASSETS_{year}"
+        if r:
+            existing = r.get(initial_key)
+            if not existing or abs(int(existing) - int(grand_total)) < 1000:
+                # 기존 값이 없거나, 오늘 저장한 부정확한 값이면 역산값으로 덮어쓰기
+                r.set(initial_key, str(estimated_initial))
+
+        ytd_profit = int(grand_total) - estimated_initial
+        ytd_rate = (ytd_profit / estimated_initial * 100) if estimated_initial > 0 else 0.0
         ytd_icon = "🟢" if ytd_profit >= 0 else "🔴"
         report += (
             f"\n\n📅 [{year}년 자산 수익률] {year}.01.01 ~ {now_dt.strftime('%m.%d')}"
-            f"\n┗ 연초: {initial_assets:,}원 → 현재: {int(grand_total):,}원"
-            f"\n┗ {ytd_icon} 변동: {ytd_profit:,}원 ({ytd_rate:+.2f}%)"
+            f"\n┗ 연초: {estimated_initial:,}원 → 현재: {int(grand_total):,}원"
+            f"\n┗ {ytd_icon} 변동: {ytd_profit:+,}원 ({ytd_rate:+.2f}%)"
         )
+    except Exception as e:
+        report += f"\n\n📅 올해 자산 수익률 계산 오류: {e}"
 
     return report
 
