@@ -115,11 +115,18 @@ def send_telegram_message(content: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     for chunk in _chunk_message(content, TELEGRAM_MAX_LEN):
         try:
-            res = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=10)
+            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": chunk, "disable_web_page_preview": True}
+            if "[" in chunk and "](" in chunk:
+                payload["parse_mode"] = "Markdown"
+            res = requests.post(url, json=payload, timeout=10)
             if res.status_code == 429:
                 retry_after = res.json().get("parameters", {}).get("retry_after", 1)
                 time.sleep(retry_after)
-                requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=10)
+                requests.post(url, json=payload, timeout=10)
+            elif not res.json().get("ok") and payload.get("parse_mode"):
+                # Markdown 파싱 실패 시 plain text로 재시도
+                del payload["parse_mode"]
+                requests.post(url, json=payload, timeout=10)
         except Exception as e:
             print(f"[텔레그램 전송 오류] {e}")
 
@@ -1035,15 +1042,13 @@ def get_upcoming_etf_report() -> str:
     return "\n".join(lines)
 
 def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
-    """Google News RSS로 ETF 관련 뉴스 제목 검색."""
+    """Google News RSS로 ETF 관련 뉴스 검색. 마크다운 링크 형태 반환."""
     import re as _re
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    # 브랜드명 추출
     brand_match = _re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|RISE|PLUS|KIWOOM)", etf_name)
     brand = brand_match.group(1) if brand_match else ""
 
-    # 테마 추출
     theme = _re.sub(
         r"(미래에셋|한국투자|삼성|KB|하나|신한|키움|NH|증권|상장지수|투자신탁|주식|채권혼합|액티브|신탁형|\[.*?\]|\(.*?\)|\d+Q?)",
         "", etf_name
@@ -1060,17 +1065,25 @@ def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
             res = requests.get(url, headers=headers, timeout=8)
             if res.status_code != 200:
                 continue
-            items_raw = _re.findall(r"<item>.*?<title>(.*?)</title>", res.text, _re.DOTALL)
+            items_raw = _re.findall(
+                r"<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>",
+                res.text, _re.DOTALL
+            )
             results = []
-            for raw_title in items_raw:
+            for raw_title, link in items_raw:
                 title = _re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", raw_title).strip()
+                link = link.strip()
                 source = ""
                 if " - " in title:
                     parts = title.rsplit(" - ", 1)
                     title = parts[0].strip()
                     source = parts[1].strip()
                 if len(title) > 10 and "Google" not in title:
-                    entry = f"{title} ({source})" if source else title
+                    display = f"{title} ({source})" if source else title
+                    # 마크다운 특수문자 이스케이프 (괄호)
+                    safe_display = display.replace("[", "\\[").replace("]", "\\]")
+                    safe_link = link.replace(")", "%29")
+                    entry = f"[{safe_display}]({safe_link})"
                     results.append(entry)
                 if len(results) >= max_results:
                     break
