@@ -951,6 +951,22 @@ def detect_newly_listed_etfs() -> str:
 
     return "\n\n".join(msgs) if msgs else ""
 
+def get_new_etf_daily_report() -> str:
+    """매일 신규 상장 ETF 체크 → 상세 리포트 생성"""
+    if not is_trading_day():
+        return ""
+    new_msg = detect_newly_listed_etfs()
+    if not new_msg:
+        return ""
+
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    return (
+        f"{'━'*28}\n"
+        f"🆕 [신규 상장 ETF 리포트] {today}\n\n"
+        f"{new_msg}\n\n"
+        f"💡 신규 ETF는 상장 초기 유동성이 낮을 수 있으니 거래량 확인 후 투자를 검토하세요."
+    )
+
 def get_weekly_etf_briefing() -> str:
     """주간 ETF 브리핑: 신규 상장 ETF 감지 + 간단 요약 (매주 첫 거래일)"""
     current_etfs = _fetch_naver_etf_list()
@@ -1300,6 +1316,17 @@ def job_weekly_etf_briefing():
     except Exception as e:
         send_alert_message(f"❌ 주간 ETF 브리핑 오류: {e}")
 
+def job_daily_new_etf_check():
+    """매일 08:10 — 당일 신규 상장 ETF 상세 리포트"""
+    if not is_trading_day():
+        return
+    try:
+        msg = get_new_etf_daily_report()
+        if msg:
+            send_alert_message(msg)
+    except Exception as e:
+        send_alert_message(f"❌ 신규 ETF 체크 오류: {e}")
+
 def job_monthly_etf_report():
     """매월 첫 거래일 08:10 — 월간 ETF 수익률 리포트"""
     now = datetime.now(KST)
@@ -1377,8 +1404,9 @@ def run():
     # 스케줄
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-    schedule.every().day.at("08:10").do(job_weekly_etf_briefing)     # 주간 ETF (첫 거래일만)
-    schedule.every().day.at("08:10").do(job_monthly_etf_report)     # 월간 ETF (첫 거래일만)
+    schedule.every().day.at("08:10").do(job_daily_new_etf_check)     # 매일: 신규 ETF 상장 리포트
+    schedule.every().day.at("08:10").do(job_weekly_etf_briefing)    # 매주 첫 거래일: 주간 ETF
+    schedule.every().day.at("08:10").do(job_monthly_etf_report)    # 매월 첫 거래일: 월간 ETF
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
     schedule.every().day.at("15:50").do(job_snapshot_foreign_flow)
 
