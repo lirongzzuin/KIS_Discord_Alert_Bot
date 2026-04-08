@@ -1,72 +1,52 @@
 # KIS Trading Alert Bot (Discord & Telegram)
 
-한국투자증권(OpenAPI) 보유/체결 변화, 일일·주간 리포트, 외국인 수급 추세, ETF 상장 일정 등을 자동으로 수집·요약하여 Discord와 Telegram으로 전달하는 프로덕션 지향의 알림 봇입니다.  
-기술 PM(프로덕트 오너십·데이터 파이프라인 기획)과 백엔드 개발 역량(안정성·장애 복구·API 통합)을 함께 보여주기 위해 설계되었습니다.
-
----
-
-## What this project demonstrates
-
-- **문제 정의 → 데이터 파이프라인 설계 → 운영 자동화**까지의 E2E 오너십
-- **국내/해외 계좌 도메인 모델링**(현금/평가/실현손익/순입금/수급)과 API 불안정성에 대한 **페일세이프 설계**
-- **스팸 방지·중복 억제**를 위한 스냅샷 기반 디듀플리케이션( Redis )
-- 운영 친화적 기능: **시각화보다 알림의 질**(요약·근거·실패 원인), **시간표 기반 스케줄**, **장애 알림**
+한국투자증권 OpenAPI 기반의 실시간 투자 알림 봇.  
+보유 종목 변동, 수익률 리포트, ETF 시장 브리핑, 외국인 수급 추세 등을 Discord + Telegram으로 자동 전송합니다.
 
 ---
 
 ## 주요 기능
 
-### 1) 체결/보유 변화 알림 (국내·해외)
-- 보유 수량 스냅샷을 Redis에 저장하고, **변화가 있을 때만** 메시지 발송합니다(국내: 장중만, 해외: 24시간).  
-- 매도 시 현재가와 평균단가로 **추정 실현손익**을 계산하여 함께 제공합니다.
+### 실시간 잔고 변동 감지
+- **국내**: 장중(09~15시) 60초마다 보유 수량 변화 감지 → 매수/매도 체결 알림
+- **해외**: 24시간 60초마다 보유 변화 감지 (미국/일본/홍콩/중국)
+- 스냅샷 기반 디듀플리케이션으로 중복 알림 방지
 
-### 2) 수익률·현금·누적 리포트
-- 국내 계좌: 평가금액/수익금/수익률 + **수급 요약(외국인·기관 일중 수급)**을 포함한 보고서 전송
-- **연간 누적 실현손익**(2025 기준)과 누적 수익률을 KIS API로 조회해 합산 노출
-- **순입금(연간 입·출금)**을 별도 조회하여 총자산 대비의 의미 있는 성과지표를 계산
+### 종합 리포트 (매일 08:30 / 16:00)
+- 보유 종목별 수익률 + 외국인/기관 수급 요약
+- **총 자산 현황**: 국내 + 해외 + 예수금
+- **총 누적 수익**: 미실현 평가손익 + 전체기간 실현손익 (KIS API 최대 10년)
+- **올해 누적 수익**: 미실현 + 올해 실현손익 (매도 확정 기준)
 
-### 3) 해외 보유/평가(원화 환산)
-- 시장·국가·거래소 조합으로 해외 보유 종목을 조회하고, **미국 거래소(NASD/NYSE/AMEX)** 누락을 보완
-- KIS 환율 API + **Redis 캐시 + 환경변수 폴백**으로 **안정적인 원화 환산**
+### ETF 브리핑
+- **주간** (매주 첫 거래일 08:10): 신규 상장 ETF 감지 + 거래량 TOP 5
+- **월간** (매월 첫 거래일 08:10): 3개월 수익률 TOP/WORST 10 + 시가총액 TOP 10
+- 네이버 금융 ETF API 기반 (무료, 키 불필요)
 
-### 4) 상장 일정 및 수급 추세
-- **KSD 상장정보 API**로 당일/주간 **ETF 상장 일정**을 요약
-- Redis에 일자별 외국인 **순매수 스냅샷 누적 → 상승 추세 스코어링** 후 Top N 리포트
+### 외국인 수급 추세 (매일 08:20)
+- Redis에 일자별 외국인 순매수 스냅샷 누적
+- 상승 추세 스코어링 → TOP N 리포트
 
-### 5) 운영 편의/안정성
-- 시작/종료/오류 시 상태 메시지 자동 전송
-- API 오류·네트워크 예외에 대한 **재시도·폴백·메시지 최소화**
-- Redis 미사용 환경에서도 핵심 기능이 동작하도록 **옵셔널 의존성**으로 구성
+### 안정성
+- Redis 미사용 시에도 핵심 기능 동작 (스냅샷/캐시 기능만 제한)
+- Discord 2000자 / Telegram 4096자 자동 분할
+- Discord Rate Limit 자동 대응
+- Docker SIGTERM 핸들링 (fly.io graceful shutdown)
+- 한국 공휴일 자동 판별 (`holidays` 패키지)
 
 ---
 
-## 시스템 구성
+## 스케줄
 
-```
-kis_discord_alert.py
-├─ Schedulers: schedule 모듈로 고정 시간 작업 실행
-│   ├─ 08:10  주간 ETF 상장(첫 거래일 1회)
-│   ├─ 08:20  당일 상장 ETF + 외국인 추세 TopN
-│   ├─ 08:30  국내 상세 리포트
-│   ├─ 15:50  외국인 수급 일중 스냅샷
-│   └─ 16:00  국내 상세 + 2025 누적 실현손익
-├─ Realtime Loop (매 60초)
-│   ├─ 국내: 장중(09~15시) 보유 변화만 감지·발송
-│   └─ 해외: 24h 보유 변화만 감지·발송
-├─ Adapters
-│   ├─ KIS REST: 토큰 캐시, 잔고/손익/수급/환율/상장정보
-│   ├─ Discord Webhook
-│   └─ Telegram Bot API
-└─ Persistence (옵션)
-    └─ Redis: 토큰·스냅샷·환율·수급시계열
-```
-
-**Redis 키 설계(발췌)**  
-- `KIS_ACCESS_TOKEN`, `KIS_TOKEN_EXPIRE_TIME`: 액세스 토큰 캐시  
-- `LAST_HOLDINGS`, `LAST_HOLDINGS_OVRS`: 국내/해외 보유 수량 스냅샷  
-- `FX:USDKRW` 등: 환율 캐시(유효기간 TTL)  
-- `FRGN_FLOW:{code}`: 외국인 순매수 일자별 해시  
-- `KSD_ETF_ALERTED_BYDATE:{yyyymmdd}`: 당일 알림 중복 방지
+| 시간(KST) | 기능 | 주기 |
+|---|---|---|
+| 08:10 | 주간 ETF 브리핑 (신규 상장 감지) | 매주 첫 거래일 |
+| 08:10 | 월간 ETF 수익률 리포트 | 매월 첫 거래일 |
+| 08:20 | 외국인 수급 추세 TOP N | 매일 거래일 |
+| 08:30 | 국내 보유 종목 상세 리포트 | 매일 거래일 |
+| 15:50 | 외국인 수급 스냅샷 저장 | 매일 거래일 |
+| 16:00 | 종합 리포트 (자산현황 + 누적수익) | 매일 거래일 |
+| 매 60초 | 국내(장중)/해외(24h) 잔고 변동 감지 | 실시간 |
 
 ---
 
@@ -74,40 +54,39 @@ kis_discord_alert.py
 
 ### 요구 사항
 - Python 3.10+
-- (선택) Redis 6+
-- KIS OpenAPI 앱 등록/승인, Discord Webhook, Telegram Bot/Chat ID
+- (선택) Redis 6+ (Upstash 무료 티어 추천)
+- KIS OpenAPI 앱키, Discord Webhook, Telegram Bot/Chat ID
 
 ### 의존성
 ```bash
 pip install -r requirements.txt
 ```
 
-### 환경변수(.env)
+### 환경변수 (.env)
 ```env
-# KIS 인증
+# KIS 인증 (필수)
 KIS_APP_KEY=your_kis_app_key
 KIS_APP_SECRET=your_kis_app_secret
 KIS_ACCOUNT_NO=12345678-01
 
-# 알림 채널
+# 알림 채널 (최소 1개 필수)
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxxx/xxxx
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 TELEGRAM_CHAT_ID=your_chat_id
 
-# Redis (옵션)
-REDIS_URL=redis://localhost:6379
+# Redis (선택 — 스냅샷/캐시/수급추세에 사용)
+REDIS_URL=redis://default:password@host:6379
 
-# 환율 폴백 및 캐시
+# 환율 폴백 (선택)
 FALLBACK_USDKRW=1350
 FALLBACK_JPYKRW=9.5
 FALLBACK_HKDKRW=175
 FALLBACK_CNYKRW=190
 FX_CACHE_TTL_SEC=900
 
-# 외국인 추세 TopN
+# 외국인 추세 TopN (선택)
 FOREIGN_TREND_TOPN=15
 ```
-> `.env`는 반드시 버전관리에서 제외하세요.
 
 ### 실행
 ```bash
@@ -116,105 +95,82 @@ python kis_discord_alert.py
 
 ---
 
-## 스케줄 및 동작 정책
+## fly.io 배포
 
-| 시간(KST) | 작업 | 비고 |
-|---|---|---|
-| 08:10 | 주간 ETF 상장 예정(첫 거래일 1회) | KSD 상장정보 |
-| 08:20 | 당일 상장 ETF + 외국인 추세 TopN | Redis 누적 기반 |
-| 08:30 | 국내 상세 리포트 | 평가/수익/수급 포함 |
-| 15:50 | 외국인 수급 스냅샷 | 다음날 추세 계산에 반영 |
-| 16:00 | 국내 상세 + 2025 누적 실현손익 | 연간 리포트 포함 |
-| 매 60초 | 보유 변화 감지 | 국내: 장중만, 해외: 24h |
-
-**중복 방지**: 보유 스냅샷 대비 **변화가 없으면 아무 메시지도 전송하지 않습니다.**  
-**해외 보완**: 국가/시장(10/20/30/40) + 거래소(NASD/NYSE/AMEX) 조합으로 조회, **미국 누락을 보완**합니다. 최종 실패 시 전체 폴백 1회를 수행합니다.
-
----
-
-## 메시지 포맷(예시)
-
-체결/보유 변화
-```
-[국내 잔고 변동 내역]
-삼성전자 수량 증가: 10 → 12주
-┗ 평가금액/수익금/수익률 요약 …
+### 1. fly.io CLI 설치 및 로그인
+```bash
+brew install flyctl
+flyctl auth login
 ```
 
-해외 보유 리포트(요청 시)
+### 2. 앱 생성 (최초 1회)
+```bash
+cd KIS_Discord_Alert_Bot
+flyctl apps create kis-discord-alert-bot --org personal
 ```
-[해외 보유 종목 수익률]
-AAPL (NASDAQ) [USD]
-┗ 수량: 3.0000 | 평균단가: 180.20 USD (243,000원)
-┗ 현재가: 191.40 USD (258,000원)
-┗ 평가금액/수익금/수익률 …
+
+### 3. Redis 생성 (선택)
+```bash
+flyctl redis create --name kis-alert-redis --region nrt --no-replicas --enable-eviction -o personal
+```
+- ProdPack 질문에 **No** 선택
+- 출력된 Redis URL 복사
+
+### 4. 시크릿 등록
+```bash
+flyctl secrets set \
+  KIS_APP_KEY="..." \
+  KIS_APP_SECRET="..." \
+  KIS_ACCOUNT_NO="12345678-01" \
+  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..." \
+  TELEGRAM_BOT_TOKEN="..." \
+  TELEGRAM_CHAT_ID="..." \
+  REDIS_URL="redis://..." \
+  --app kis-discord-alert-bot
+```
+
+### 5. 배포
+```bash
+flyctl deploy
+```
+
+### 6. 확인
+```bash
+flyctl logs --app kis-discord-alert-bot --no-tail | tail -20
+flyctl status --app kis-discord-alert-bot
 ```
 
 ---
 
 ## 기술 세부사항
 
-### KIS API 통합
-- 토큰 관리: OAuth2 Client Credentials, Redis TTL 캐시
-- 국내 잔고·평가: `TTTC8434R`
-- 국내 실현손익: `TTTC8494R`
-- 누적 실현손익(기간): `TTTC8715R`
-- 수급(외국인/기관): `FHKST01010900`
-- 해외 잔고: `CTRP6504R` (페이지네이션: `CTX_AREA_FK200/NK200`)
-- 환율: `HHDFS00000300` (없을 경우 폴백 사용)
+### KIS API 활용
+| API (tr_id) | 용도 |
+|---|---|
+| `TTTC8434R` | 국내 잔고/평가 |
+| `TTTC8494R` | 국내 실현손익 |
+| `TTTC8715R` | 기간별 누적 실현손익 (최대 10년) |
+| `TTTC8908R` | 예수금/주문가능금액 |
+| `CTRP6504R` | 해외 현재잔고 |
+| `HHDFS00000300` | 환율 조회 |
+| `FHKST01010900` | 외국인/기관 수급 |
+| `FHPTJ04400000` | 외국인/기관 종합 |
 
-### 안정성/폴백 전략
-- **해외 잔고 파라미터 오류 방지**: `INQR_DVSN_CD`, `TR_MKET_CD`, `NATN_CD`, `OVRS_EXCG_CD`, `WCRC_FRCR_DVSN_CD`, `TR_CRCY_CD`를 항상 명시하고, 조합별 반복 조회 + 전체 폴백을 수행합니다.
-- **입출금 조회 404 처리**: 기간 내 내역이 없을 경우 0으로 간주.
-- **환율**: KIS 응답 실패 시 환경변수 폴백 수치를 사용하고 결과는 TTL 캐시.
-- **메시지 억제**: 스냅샷이 동일하면 전송하지 않음(스팸 방지).
+### 누적 수익 계산 방식
+- **미실현 손익** = 현재 보유 평가금액 - 투자원금 (국내 + 해외)
+- **실현 손익** = KIS API `TTTC8715R` 기간별 조회 (매도 확정)
+- **총 누적** = 미실현 + 전체기간 실현 (최대 10년)
+- **올해 누적** = 미실현 + 올해 실현
+- Redis 의존 없이 KIS API만으로 계산
 
-### 데이터 모델링
-- 해외 종목은 `(종목코드, 거래소)` 키로 디듀플리케이션하여 **평가금액이 큰 레코드 우선**.
-- 실현손익/순입금/평가손익을 **연결하여** 의미 있는 지표(연간 성과, 총자산 대비 성과)를 계산.
-
----
-
-## 트러블슈팅
-
-| 증상 | 원인 | 해결 |
-|---|---|---|
-| `ERROR : INPUT_FIELD_NAME INQR_DVSN_CD` 등 파라미터 오류 | API 호출 시 필수 파라미터 누락 | 본 프로젝트는 모든 케이스에서 파라미터를 강제 지정하고, 실패 시 다른 조합·전체 폴백으로 재조회합니다. KIS 앱 권한/계좌번호 형식도 확인하세요. |
-| 해외 잔고가 비어 있음 | 거래소별 누락·페이지네이션 미처리 | 미국(NASD/NYSE/AMEX) 추가 조회 + `CTX_AREA_FK200/NK200`로 다음 페이지가 있을 때 자동 페이지네이션 |
-| 누적 리포트 값이 다름 | KIS 실현손익 API와 일치하지 않는 자체 계산 | `TTTC8715R` 응답 값을 신뢰 소스로 사용. 예외 시 오류 메시지를 리포트에 표시 |
-| 메시지가 너무 많음 | 빠른 변동 구간 | 스냅샷 비교로 중복 억제. 필요 시 주기(60s) 또는 장중 체크 조건을 조정 |
+### ETF 신규 상장 감지
+- 네이버 금융 ETF API에서 전종목 코드 세트를 일일 비교
+- 이전 스냅샷에 없던 코드가 등장하면 신규 상장으로 판별
+- Redis에 스냅샷 저장 (Redis 없으면 감지 불가)
 
 ---
 
-## 확장 포인트
+## 라이선스
 
-- Slack/Email 등 새로운 채널 어댑터 추가
-- 웹소켓 기반 체결 실시간화(국내/해외)
-- REST API + 대시보드(Flask/FastAPI)로 운영 가시성 강화
-- 월간·연간 자동 리포트, 전략 통계(섹터/스타일/알파 분해)
-
----
-
-## 보안·운영 가이드
-
-- `.env`는 VCS에 커밋하지 않습니다.
-- API 키·토큰은 프로세스 메모리와 Redis(만료 포함)에만 존재합니다.
-- 네트워크 오류·API 레이트 제한 시 **슬랙형 경고 대신 로컬 로그/요약 알림** 기조를 유지합니다.
-
----
-
-## 라이선스 및 사용 조건
-
-- 개인/학습 목적 사용 및 수정 가능. 상업적 이용은 별도 협의가 필요합니다.
-- 본 프로젝트·문서의 출처를 명시해 주세요.
-- Copyright © 2025 Younggyun Lee.
-
----
-
-## 빠른 시작 체크리스트
-
-1) KIS 앱키/시크릿, 계좌번호 준비  
-2) Discord Webhook, Telegram Bot/Chat ID 생성  
-3) (선택) Redis 실행 후 `REDIS_URL` 설정  
-4) 환율 폴백 수치 점검(운영 국가에 맞게 수정)  
-5) `python kis_discord_alert.py` 실행 → 시작/리포트 메시지 확인
+개인/학습 목적 사용 및 수정 가능. 상업적 이용은 별도 협의 필요.  
+Copyright © 2025-2026 Younggyun Lee.

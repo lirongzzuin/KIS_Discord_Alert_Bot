@@ -1,0 +1,22 @@
+app = "kis-discord-alert-bot"
+primary_region = "nrt"
+
+[build]
+
+[env]
+  TZ = "Asia/Seoul"
+  FALLBACK_USDKRW = "1350"
+  FALLBACK_JPYKRW = "9.5"
+  FALLBACK_HKDKRW = "175"
+  FALLBACK_CNYKRW = "190"
+  FX_CACHE_TTL_SEC = "900"
+  FOREIGN_TREND_TOPN = "15"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  auto_stop_machines = "off"
+  auto_start_machines = false
+
+[processes]
+  app = "python kis_discord_alert.py"

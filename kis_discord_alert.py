@@ -2,6 +2,8 @@
 import os
 import json
 import time
+import signal
+import sys
 import schedule
 import requests
 import redis
@@ -9,8 +11,9 @@ import traceback
 from datetime import datetime, timedelta, date
 from pytz import timezone
 from dotenv import load_dotenv
-from threading import Thread
+from threading import Thread, Event
 from typing import List, Dict, Tuple, Optional
+import holidays
 
 # ================== 환경설정 ==================
 load_dotenv()
@@ -18,7 +21,7 @@ KIS_APP_KEY = os.getenv("KIS_APP_KEY")
 KIS_APP_SECRET = os.getenv("KIS_APP_SECRET")
 KIS_ACCOUNT_NO = os.getenv("KIS_ACCOUNT_NO", "")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -33,15 +36,59 @@ FX_CACHE_TTL_SEC = int(os.getenv("FX_CACHE_TTL_SEC", "900"))
 FOREIGN_TREND_TOPN = int(os.getenv("FOREIGN_TREND_TOPN", "15"))
 KST = timezone("Asia/Seoul")
 
+# Graceful shutdown
+shutdown_event = Event()
+
+def _handle_signal(signum, frame):
+    print(f"[시그널 수신] {signum} — 종료 중...")
+    shutdown_event.set()
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
+
+# ================== 동적 연도 ==================
+def current_year() -> int:
+    return datetime.now(KST).year
+
+def current_year_str() -> str:
+    return str(current_year())
+
+def year_start_date() -> str:
+    return f"{current_year()}0101"
+
 # ================== Redis ==================
-try:
-    r = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
-    r.ping()
-except Exception as e:
-    print(f"Redis 연결 실패: {e}")
-    r = None
+r = None
+if REDIS_URL:
+    try:
+        r = redis.StrictRedis.from_url(REDIS_URL, decode_responses=True)
+        r.ping()
+        print(f"[Redis] 연결 성공")
+    except Exception as e:
+        print(f"[Redis] 연결 실패 (Redis 없이 계속 동작): {e}")
+        r = None
+else:
+    print("[Redis] REDIS_URL 미설정 — Redis 없이 동작합니다 (스냅샷/캐시 기능 제한)")
 
 # ================== 발송 ==================
+DISCORD_MAX_LEN = 1950
+TELEGRAM_MAX_LEN = 4000
+
+def _chunk_message(content: str, max_len: int) -> List[str]:
+    if len(content) <= max_len:
+        return [content]
+    chunks = []
+    lines = content.split("\n")
+    current = ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > max_len:
+            chunks.append(current)
+            current = line
+        else:
+            current = current + "\n" + line if current else line
+    if current:
+        chunks.append(current)
+    return chunks
+
 def send_alert_message(content: str):
     if not content:
         return
@@ -49,35 +96,56 @@ def send_alert_message(content: str):
     send_telegram_message(content)
 
 def send_discord_message(content: str):
-    try:
-        if DISCORD_WEBHOOK_URL:
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=10)
-    except Exception as e:
-        print(f"[디스코드 전송 오류] {e}")
-        traceback.print_exc()
+    if not DISCORD_WEBHOOK_URL:
+        return
+    for chunk in _chunk_message(content, DISCORD_MAX_LEN):
+        try:
+            resp = requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk}, timeout=10)
+            if resp.status_code == 429:
+                retry_after = resp.json().get("retry_after", 1)
+                time.sleep(retry_after)
+                requests.post(DISCORD_WEBHOOK_URL, json={"content": chunk}, timeout=10)
+        except Exception as e:
+            print(f"[디스코드 전송 오류] {e}")
 
 def send_telegram_message(content: str):
-    try:
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "text": content}
-            res = requests.post(url, data=payload, timeout=10)
-            res.raise_for_status()
-    except Exception as e:
-        print(f"[텔레그램 전송 오류] {e}")
-        traceback.print_exc()
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for chunk in _chunk_message(content, TELEGRAM_MAX_LEN):
+        try:
+            res = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=10)
+            if res.status_code == 429:
+                retry_after = res.json().get("parameters", {}).get("retry_after", 1)
+                time.sleep(retry_after)
+                requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": chunk}, timeout=10)
+        except Exception as e:
+            print(f"[텔레그램 전송 오류] {e}")
 
 # ================== 휴장/장운영 ==================
-HOLIDAYS_2025 = {
-    "2025-01-01","2025-01-27","2025-01-28","2025-01-29","2025-01-30",
-    "2025-03-03","2025-05-01","2025-05-05","2025-05-06","2025-06-06",
-    "2025-08-15","2025-10-03","2025-10-06","2025-10-07","2025-10-08",
-    "2025-10-09","2025-12-31",
+# holidays 패키지로 한국 공휴일 자동 판별 (연도 하드코딩 불필요)
+_kr_holidays_cache: Dict[int, holidays.HolidayBase] = {}
+
+# 증시 추가 휴장일 (holidays 패키지에 없는 경우 — 연말 폐장 등)
+_EXTRA_MARKET_CLOSED = {
+    "12-31",  # 연말 폐장일 (매년 고정)
 }
+
+def _get_kr_holidays(year: int) -> holidays.HolidayBase:
+    if year not in _kr_holidays_cache:
+        _kr_holidays_cache[year] = holidays.KR(years=year)
+    return _kr_holidays_cache[year]
 
 def is_holiday(dt: datetime = None):
     now = dt or datetime.now(KST)
-    return (now.year == 2025) and (now.strftime("%Y-%m-%d") in HOLIDAYS_2025)
+    d = now.date() if hasattr(now, 'date') else now
+    # holidays 패키지 공휴일 체크
+    if d in _get_kr_holidays(d.year):
+        return True
+    # 증시 추가 휴장일 체크 (MM-DD)
+    if d.strftime("%m-%d") in _EXTRA_MARKET_CLOSED:
+        return True
+    return False
 
 def is_trading_day(dt: datetime = None):
     now = dt or datetime.now(KST)
@@ -88,12 +156,20 @@ def is_market_hour(dt: datetime = None):
     return 9 <= now.hour <= 15
 
 # ================== 공통 유틸/토큰 ==================
+_token_cache = {"token": None, "expire": 0.0}
+
 def get_kis_access_token():
     now_ts = time.time()
+    # 메모리 캐시 (Redis 없이도 동작)
+    if _token_cache["token"] and _token_cache["expire"] > now_ts:
+        return _token_cache["token"]
+    # Redis 캐시
     if r:
         token = r.get("KIS_ACCESS_TOKEN")
         expire_ts = r.get("KIS_TOKEN_EXPIRE_TIME")
         if token and expire_ts and float(expire_ts) > now_ts:
+            _token_cache["token"] = token
+            _token_cache["expire"] = float(expire_ts)
             return token
     url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
     headers = {"Content-Type": "application/json"}
@@ -103,9 +179,12 @@ def get_kis_access_token():
         raise Exception(f"[토큰 오류] {res}")
     token = res["access_token"]
     expires_in = int(res.get("expires_in", 86400))
+    expire_at = now_ts + expires_in - 60
+    _token_cache["token"] = token
+    _token_cache["expire"] = expire_at
     if r:
         r.set("KIS_ACCESS_TOKEN", token)
-        r.set("KIS_TOKEN_EXPIRE_TIME", now_ts + expires_in - 60)
+        r.set("KIS_TOKEN_EXPIRE_TIME", expire_at)
     return token
 
 def safe_int(v):
@@ -123,7 +202,6 @@ def parse_int_field(value):
     except ValueError: return 0
 
 def get_market_summary(token, stock_code):
-    # 장 마감 이후 집계
     now = datetime.now(KST)
     if now.hour < 15 or (now.hour == 15 and now.minute < 40):
         return ""
@@ -274,7 +352,6 @@ def _call_overseas_present_balance_once(base_params: dict) -> dict:
     params = {
         "CANO": cano,
         "ACNT_PRDT_CD": acct_cd,
-        # 필수/환경의존 파라미터를 모두 포함
         "INQR_DVSN_CD": base_params.get("INQR_DVSN_CD", "01"),
         "TR_MKET_CD": base_params.get("TR_MKET_CD",""),
         "NATN_CD": base_params.get("NATN_CD",""),
@@ -311,18 +388,12 @@ def _paginate_all_pages(initial_params: dict) -> List[dict]:
     return results
 
 def get_overseas_present_balance() -> List[dict]:
-    """
-    해외 현재잔고 조회
-    - 국가/시장 코드 기반(10/20/30/40) x 원화/외화
-    - 미국 거래소 코드(NASD/NYSE/AMEX) 기반 x 원화/외화 (누락 보완)
-    - 전부 실패/0이면 전체 폴백 1회
-    """
     all_rows: List[dict] = []
     errors: List[str] = []
 
     # 1) 국가/시장 기반
     for tr_mket_cd, natn_cd, _desc in MARKET_COUNTRY_LIST:
-        for wcrc in ("01","02"):   # 01:원화, 02:외화
+        for wcrc in ("01","02"):
             try:
                 rs = _paginate_all_pages({
                     "INQR_DVSN_CD": "01",
@@ -377,17 +448,12 @@ def get_overseas_present_balance() -> List[dict]:
     return all_rows
 
 def _parse_overseas_row(row: dict) -> Optional[dict]:
-    """
-    배포본마다 다른 응답 필드를 폭넓게 대응
-    -> 표준화 출력(dict)
-    """
     if not row:
         return None
     name = row.get("ovrs_item_name") or row.get("prdt_name") or row.get("hts_kor_isnm") or ""
     code = row.get("ovrs_pdno") or row.get("pdno") or row.get("symb") or ""
     market = (row.get("ovrs_excg_cd") or row.get("excg_cd") or "").upper()
 
-    # 수량
     qty = safe_float(
         row.get("ovrs_cblc_qty")
         or row.get("hldg_qty")
@@ -398,7 +464,6 @@ def _parse_overseas_row(row: dict) -> Optional[dict]:
     if qty <= 0:
         return None
 
-    # 평균/현재가(현지통화)
     avg_ccy = safe_float(
         row.get("frcr_pchs_avg_pric")
         or row.get("pchs_avg_pric")
@@ -433,7 +498,7 @@ def _parse_overseas_row(row: dict) -> Optional[dict]:
 def get_overseas_account_profit(only_changes=True) -> str:
     rows = get_overseas_present_balance()
     parsed: List[dict] = []
-    dedup = {}  # (code, market) -> best row (평가금액 큰 것 선택)
+    dedup = {}
 
     for row in rows:
         p = _parse_overseas_row(row)
@@ -446,7 +511,6 @@ def get_overseas_account_profit(only_changes=True) -> str:
     parsed = list(dedup.values())
     parsed.sort(key=lambda x: x["eval_krw"], reverse=True)
 
-    # 스냅샷 불러오기/저장
     last_json = r.get("LAST_HOLDINGS_OVRS") if r else None
     last = json.loads(last_json) if last_json else {}
 
@@ -480,89 +544,94 @@ def get_overseas_account_profit(only_changes=True) -> str:
 
     if r: r.set("LAST_HOLDINGS_OVRS", json.dumps(snap))
 
-    # 🔧 핵심 수정: 변동이 없으면 빈 문자열 반환(알림 전송 X)
     if only_changes:
         return ("🌍 [해외 잔고 변동]\n" + "\n".join(changes)) if changes else ""
 
     if not parsed:
-        return ""  # 상세 보고 요청이어도 보유 없으면 굳이 전송하지 않음
+        return ""
 
-    # 상세 리포트
     lines = []
     if changes:
-        lines.append("🌍 [해외 잔고 변동]\n" + "\n".join(changes) + "\n")
+        lines.append("🌍 [해외 잔고 변동]\n" + "\n".join(changes))
+    lines.append(f"{'━'*28}")
     lines.append("🌍 [해외 보유 종목 수익률]")
     for it in parsed:
         icon = "🟢" if it["profit_krw"] >= 0 else "🔴"
         lines.append(
             f"{icon} {it['name']} ({it['code']}:{it['market']}) [{it['ccy']}]\n"
-            f"┗ 수량: {it['qty']:.4f} | 평균단가: {it['avg_ccy']:.4f} {it['ccy']} ({_fmt_price_won(it['avg_krw'])})\n"
-            f"┗ 현재가: {it['cur_ccy']:.4f} {it['ccy']} ({_fmt_price_won(it['cur_krw'])})\n"
-            f"┗ 평가금액: {_fmt_amount_won(it['eval_krw'])} | 수익금: {_fmt_amount_won(it['profit_krw'])} | 수익률: {_fmt_rate(it['rate'])}"
+            f"┗ 수량: {it['qty']:.4f} | 평균: {it['avg_ccy']:.4f} {it['ccy']} ({_fmt_price_won(it['avg_krw'])})\n"
+            f"┗ 현재: {it['cur_ccy']:.4f} {it['ccy']} ({_fmt_price_won(it['cur_krw'])})\n"
+            f"┗ 평가: {_fmt_amount_won(it['eval_krw'])} | 손익: {_fmt_amount_won(it['profit_krw'])} ({_fmt_rate(it['rate'])})"
         )
     total_rate = (total_profit/total_invest*100) if total_invest else 0.0
-    lines.append(
-        f"\n🌍 합계 평가금액: {_fmt_amount_won(total_eval)}"
-        f"\n🌍 합계 수익금: {_fmt_amount_won(total_profit)}"
-        f"\n🌍 합계 수익률: {_fmt_rate(total_rate)}"
-    )
+    ov_icon = "🟢" if total_profit >= 0 else "🔴"
+    lines.append(f"\n{ov_icon} 해외 합계: {_fmt_amount_won(total_eval)} | 손익: {_fmt_amount_won(total_profit)} ({_fmt_rate(total_rate)})")
     return "\n".join(lines)
 
-# ================== 순입금/초기가치 ==================
-def get_net_deposit_2025(token, retries=2, timeout=10, sleep_sec=0.4):
-    url = "https://openapi.koreainvestment.com:9443/uapi/overseas-stock/v1/trading/inquire-deposit-withdraw"
+# ================== 누적수익/자산 ==================
+def _query_realized_profit_period(token, start_dt: str, end_dt: str) -> Tuple[int, float]:
+    """기간별 실현손익 조회 (TTTC8715R). (실현수익금, 실현수익률) 반환."""
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-period-trade-profit"
     headers = {
         "authorization": f"Bearer {token}", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
-        "tr_id": "TTTC8991R", "Content-Type": "application/json"
+        "tr_id": "TTTC8715R", "custtype": "P", "Content-Type": "application/json"
     }
     acct_raw = KIS_ACCOUNT_NO.replace("-", "")
     cano, acct_cd = acct_raw[:8], acct_raw[8:]
     params = {
-        "CANO": cano, "ACNT_PRDT_CD": acct_cd, "INQR_STRT_DT": "20250101",
-        "INQR_END_DT": datetime.now(KST).strftime("%Y%m%d"),
-        "CTX_AREA_FK100": "", "CTX_AREA_NK100": "", "INQR_DVSN": "00"
+        "CANO": cano, "ACNT_PRDT_CD": acct_cd, "SORT_DVSN": "01", "PDNO": "",
+        "INQR_STRT_DT": start_dt, "INQR_END_DT": end_dt, "CBLC_DVSN": "00",
+        "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
     }
-    deposits = 0; withdrawals = 0
-    while True:
-        attempt = 0; last_err = None
-        while attempt <= retries:
-            try:
-                resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-                if resp.status_code == 404:
-                    return 0
-                if resp.status_code != 200:
-                    last_err = f"HTTP {resp.status_code} / {resp.text[:200]}"; attempt += 1; time.sleep(sleep_sec); continue
-                data = resp.json()
-                if data.get("rt_cd") != "0":
-                    msg = data.get("msg1") or data.get("msg_cd") or str(data)[:200]
-                    raise Exception(f"[입출금내역 조회 실패] {msg}")
-                for row in data.get("output", []):
-                    typ = (row.get("dpst_withdraw_gb") or "").strip()
-                    amt = safe_int(row.get("txamt", "0"))
-                    if "입금" in typ: deposits += amt
-                    elif "출금" in typ: withdrawals += amt
-                fk = (data.get("CTX_AREA_FK100") or "").strip()
-                nk = (data.get("CTX_AREA_NK100") or "").strip()
-                if fk or nk:
-                    params["CTX_AREA_FK100"] = fk; params["CTX_AREA_NK100"] = nk; time.sleep(sleep_sec); break
-                else:
-                    return deposits - withdrawals
-            except requests.exceptions.RequestException as e:
-                last_err = f"network: {e}"; attempt += 1; time.sleep(sleep_sec); continue
-        raise Exception(f"[순입금액 계산 오류] {last_err}")
+    res = requests.get(url, headers=headers, params=params, timeout=10).json()
+    if res.get("rt_cd") != "0":
+        raise Exception(f"[실현손익조회 실패] {res.get('msg1', res)}")
+    output2 = res.get("output2", {})
+    profit = safe_int(output2.get("tot_rlzt_pfls", "0"))
+    rate = safe_float(output2.get("tot_pftrt", "0"))
+    return profit, rate
 
-def get_initial_assets_2025():
+def get_initial_assets():
+    key = f"INITIAL_ASSETS_{current_year()}"
     try:
-        val = r.get("INITIAL_ASSETS_2025") if r else None
+        val = r.get(key) if r else None
         return int(val) if val else None
     except Exception as e:
         print(f"[초기 자산 조회 오류] {e}")
         return None
 
+def save_initial_assets_if_needed(total_assets: int):
+    if not r:
+        return
+    key = f"INITIAL_ASSETS_{current_year()}"
+    try:
+        if not r.exists(key):
+            r.set(key, str(total_assets))
+            print(f"[자동저장] {key} = {total_assets:,}원")
+    except Exception as e:
+        print(f"[연초 자산 저장 오류] {e}")
+
+def _get_total_overseas_eval() -> Tuple[float, float]:
+    try:
+        rows = get_overseas_present_balance()
+        dedup = {}
+        for row in rows:
+            p = _parse_overseas_row(row)
+            if not p:
+                continue
+            key = (p["code"], p["market"])
+            if key not in dedup or p["eval_krw"] > dedup[key]["eval_krw"]:
+                dedup[key] = p
+        total_eval = sum(it["eval_krw"] for it in dedup.values())
+        total_invest = sum(it["avg_krw"] * it["qty"] for it in dedup.values())
+        return total_eval, total_invest
+    except Exception:
+        return 0.0, 0.0
+
 # ================== 국내 잔고/리포트 ==================
 def get_account_profit(only_changes=True):
     token = get_kis_access_token()
-    _ = get_realized_holdings_data()  # 기존 로직 유지
+    _ = get_realized_holdings_data()
 
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
     headers = {
@@ -618,53 +687,104 @@ def get_account_profit(only_changes=True):
     parsed_items.sort(key=lambda x: x.get("eval",0), reverse=True)
     if r: r.set("LAST_HOLDINGS", json.dumps(new_holdings))
     if only_changes:
-        return ("📌 [국내 잔고 변동 내역]\n" + "\n".join(changes)) if changes else ""
+        return ("📌 [국내 잔고 변동]\n" + "\n".join(changes)) if changes else ""
 
     try: cash = get_current_cash_balance(token)
     except Exception as e: print(f"[예수금 조회 실패] {e}"); cash = 0
-    try: net_deposit = get_net_deposit_2025(token)
-    except Exception as e: print(f"[순입금 조회 실패] {e}"); net_deposit = 0
+    net_deposit = 0  # 순입금은 KIS 실현손익 API 기반으로 대체됨
 
-    total_assets = total_eval + cash
-    display_total_eval = total_assets - net_deposit
-    display_total_profit = (total_assets - net_deposit) - total_invest
-    display_total_rate = (display_total_profit/ total_invest *100) if total_invest else 0.0
+    # 해외 평가금액
+    ovrs_eval, ovrs_invest = _get_total_overseas_eval()
 
+    # 국내 총자산 = 국내 평가 + 예수금
+    kr_total = total_eval + cash
+    # 전체 총자산 = 국내 + 해외
+    grand_total = kr_total + ovrs_eval
+
+    # 연초 자산 자동 저장 (Redis 있으면)
+    save_initial_assets_if_needed(int(grand_total))
+
+    # ── 보유 종목 리포트 ──
     report = ""
-    if changes: report += "📌 [국내 잔고 변동 내역]\n" + "\n".join(changes) + "\n\n"
-    report += "📊 [보유 종목 수익률 + 수급 요약 보고]"
+    if changes: report += "📌 [국내 잔고 변동]\n" + "\n".join(changes) + "\n\n"
+    report += f"{'━'*28}\n📊 [국내 보유 종목]"
     for it in parsed_items:
         status_icon = "🟢" if it['profit'] >= 0 else "🔴"
         report += (
             f"\n{status_icon} {it['name']}\n"
-            f"┗ 수량: {it['qty']}주 | 평균단가: {int(it['avg']):,}원 | 현재가: {int(it['cur']):,}원\n"
-            f"┗ 평가금액: {it['eval']:,}원 | 수익금: {it['profit']:,}원 | 수익률: {it['rate']:.2f}%"
+            f"┗ {it['qty']}주 | 평균: {int(it['avg']):,}원 → 현재: {int(it['cur']):,}원\n"
+            f"┗ 평가: {it['eval']:,}원 | 손익: {it['profit']:,}원 ({it['rate']:+.2f}%)"
             + (f"\n┗ {it['flow']}" if it["flow"] else "")
         )
+
+    # ── 보유 종목 평가손익 (미실현) ──
+    kr_unreal_rate = (total_profit / total_invest * 100) if total_invest else 0.0
+    kr_icon = "🟢" if total_profit >= 0 else "🔴"
     report += (
-        f"\n\n📈 총 평가금액: {int(display_total_eval):,}원"
-        f"\n💰 총 수익금: {int(display_total_profit):,}원"
-        f"\n📉 총 수익률: {display_total_rate:.2f}%"
+        f"\n\n{'━'*28}"
+        f"\n{kr_icon} 국내 보유 평가손익 (미실현)"
+        f"\n┗ 평가금액: {total_eval:,}원 | 투자원금: {total_invest:,}원"
+        f"\n┗ 평가수익: {total_profit:,}원 ({kr_unreal_rate:+.2f}%)"
     )
 
+    # 해외 보유 있으면 표시
+    ovrs_profit = ovrs_eval - ovrs_invest
+    if ovrs_eval > 0:
+        ovrs_rate = (ovrs_profit / ovrs_invest * 100) if ovrs_invest else 0.0
+        ov_icon = "🟢" if ovrs_profit >= 0 else "🔴"
+        report += (
+            f"\n{ov_icon} 해외 보유 평가손익 (미실현)"
+            f"\n┗ 평가금액: {_fmt_amount_won(ovrs_eval)} | 투자원금: {_fmt_amount_won(ovrs_invest)}"
+            f"\n┗ 평가수익: {_fmt_amount_won(ovrs_profit)} ({ovrs_rate:+.2f}%)"
+        )
+
+    # ── 총 자산 현황 ──
+    report += (
+        f"\n\n{'━'*28}"
+        f"\n💼 [총 자산 현황]"
+        f"\n┗ 국내 보유: {total_eval:,}원"
+    )
+    if ovrs_eval > 0:
+        report += f"\n┗ 해외 보유: {_fmt_amount_won(ovrs_eval)}"
+    report += (
+        f"\n┗ 예수금: {cash:,}원"
+        f"\n┗ 총 자산: {int(grand_total):,}원"
+    )
+
+    # ── 총 누적 수익 (KIS API 기반) ──
+    # 총 누적 = 현재 미실현 손익 + 전체기간 실현손익 (KIS API 10년 제한)
+    total_unrealized = total_profit + int(ovrs_profit)
     try:
-        initial_assets = get_initial_assets_2025()
-        current_total_assets = total_assets
-        if initial_assets is None:
-            report += (
-                f"\n\n⚠️ 2025년 추정 수익률 계산을 위해 'INITIAL_ASSETS_2025' 값을 설정해야 합니다."
-                f"\n   (예: Redis에 'SET INITIAL_ASSETS_2025 {current_total_assets:,}')"
-            )
-        else:
-            estimated_profit_2025 = current_total_assets - initial_assets - net_deposit
-            denom = (initial_assets + net_deposit)
-            estimated_rate_2025 = (estimated_profit_2025/denom)*100 if denom else 0.0
-            report += (
-                f"\n\n📅 2025 추정 수익: {int(estimated_profit_2025):,}원"
-                f"\n📅 2025 추정 수익률: {estimated_rate_2025:.2f}%"
-            )
+        ten_years_ago = (datetime.now(KST) - timedelta(days=3650)).strftime("%Y%m%d")
+        all_realized, _ = _query_realized_profit_period(token, ten_years_ago, datetime.now(KST).strftime("%Y%m%d"))
+        all_cumulative = total_unrealized + all_realized
+        cum_icon = "🟢" if all_cumulative >= 0 else "🔴"
+        report += (
+            f"\n\n{'━'*28}"
+            f"\n📊 [총 누적 수익 (전체 기간)]"
+            f"\n┗ 보유종목 평가손익: {total_unrealized:,}원 (미실현)"
+            f"\n┗ 전체 실현손익: {all_realized:,}원 (매도 확정)"
+            f"\n┗ {cum_icon} 총 누적: {all_cumulative:,}원"
+        )
     except Exception as e:
-        report += f"\n📅 2025 추정 수익률 계산 오류: {e}"
+        report += f"\n\n📊 총 누적 수익 조회 오류: {e}"
+
+    # ── 올해 누적 수익 (KIS API 기반) ──
+    year = current_year()
+    try:
+        year_realized, year_realized_rate = _query_realized_profit_period(
+            token, year_start_date(), datetime.now(KST).strftime("%Y%m%d"))
+        year_cumulative = total_unrealized + year_realized
+        yr_icon = "🟢" if year_cumulative >= 0 else "🔴"
+        report += (
+            f"\n\n📅 [{year}년 누적 수익]"
+            f"\n┗ 보유종목 평가손익: {total_unrealized:,}원 (미실현)"
+            f"\n┗ {year}년 실현손익: {year_realized:,}원 (매도 확정)"
+            f"\n┗ {yr_icon} {year}년 총 누적: {year_cumulative:,}원"
+        )
+    except Exception as e:
+        report += f"\n\n📅 {year}년 누적 수익 조회 오류: {e}"
+
     return report
 
 def get_realized_holdings_data():
@@ -696,7 +816,7 @@ def get_realized_holdings_data():
         result[name] = realized_profit
     return result
 
-def get_yearly_realized_profit_2025():
+def get_yearly_realized_profit():
     token = get_kis_access_token()
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-period-trade-profit"
     headers = {
@@ -704,7 +824,7 @@ def get_yearly_realized_profit_2025():
         "tr_id": "TTTC8715R","custtype": "P","Content-Type": "application/json"
     }
     acct_raw = KIS_ACCOUNT_NO.replace("-", ""); cano, acct_cd = acct_raw[:8], acct_raw[8:]
-    start_dt = "20250101"; end_dt = datetime.now(KST).strftime("%Y%m%d")
+    start_dt = year_start_date(); end_dt = datetime.now(KST).strftime("%Y%m%d")
     params = {
         "CANO": cano,"ACNT_PRDT_CD": acct_cd,"SORT_DVSN": "01","PDNO": "",
         "INQR_STRT_DT": start_dt,"INQR_END_DT": end_dt,"CBLC_DVSN": "00",
@@ -718,126 +838,206 @@ def get_yearly_realized_profit_2025():
     realized_rate = safe_float(output2.get("tot_pftrt","0"))
     return realized_profit, realized_rate
 
-# ================== 예탁원 상장정보(ETF) ==================
-def _inquire_ksd_list_info(F_DT: str, T_DT: str, sht_cd: str = "") -> List[dict]:
-    token = get_kis_access_token()
-    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/ksdinfo/list-info"
-    headers = {
-        "authorization": f"Bearer {token}", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
-        "tr_id": "HHKDB669107C0", "custtype": "P", "Content-Type": "application/json"
-    }
-    params = {"SHT_CD": sht_cd or "", "T_DT": T_DT, "F_DT": F_DT, "CTS": ""}
+# ================== ETF 신규상장 감지 (네이버 금융 API 기반) ==================
+ETF_TAGS = {
+    "레버리지":"레버리지","인버스":"인버스","나스닥":"나스닥","S&P":"S&P","미국":"미국",
+    "2차전지":"2차전지","반도체":"반도체","배당":"배당","원유":"원유","금":"금",
+    "중국":"중국","테크":"테크","코스닥":"코스닥","채권":"채권","선물":"선물",
+    "ESG":"ESG","헬스케어":"헬스케어","AI":"AI","로봇":"로봇","2차전지":"배터리",
+}
+
+def _fetch_naver_etf_list() -> Dict[str, dict]:
+    """네이버 금융 ETF 전종목 리스트 조회 (무료, 키 불필요)"""
+    url = "https://finance.naver.com/api/sise/etfItemList.nhn"
+    params = {"etfType": "0", "targetColumn": "market_sum", "sortOrder": "desc"}
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=12)
-        res.raise_for_status(); data = res.json()
-        if not isinstance(data, dict) or data.get("rt_cd") != "0":
-            print(f"[상장정보일정 응답 실패] {data.get('msg1','원인 미상') if isinstance(data, dict) else '비정상 응답'}")
-            return []
-        return data.get("output1", []) or []
+        res = requests.get(url, params=params, headers=headers, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        items = data.get("result", {}).get("etfItemList", [])
+        result = {}
+        for it in items:
+            code = it.get("itemcode", "")
+            if code:
+                result[code] = {
+                    "name": it.get("itemname", ""),
+                    "code": code,
+                    "price": safe_int(it.get("nowVal", 0)),
+                    "change_rate": safe_float(it.get("changeRate", 0)),
+                    "market_cap": safe_int(it.get("marketSum", 0)),
+                    "nav": safe_float(it.get("nav", 0)),
+                    "volume": safe_int(it.get("quant", 0)),
+                    "three_month_rate": safe_float(it.get("threeMonthEarnRate", 0)),
+                }
+        return result
     except Exception as e:
-        print(f"[상장정보일정 API 오류] {e}")
-        return []
+        print(f"[네이버 ETF API 오류] {e}")
+        return {}
 
-def _normalize_ymd(s: str) -> str:
-    s = (s or "").strip()
-    if not s: return ""
-    if "-" in s: return s
-    if len(s) == 8: return f"{s[:4]}-{s[4:6]}-{s[6:]}"
-    return s
+def _get_known_etf_codes() -> set:
+    """Redis에 저장된 기존 ETF 코드 세트 반환"""
+    if not r:
+        return set()
+    try:
+        codes_json = r.get("KNOWN_ETF_CODES")
+        if codes_json:
+            return set(json.loads(codes_json))
+    except Exception as e:
+        print(f"[ETF 코드 로드 오류] {e}")
+    return set()
 
-def _is_etf(name: str, stk_kind: str = "") -> bool:
-    nm = (name or "").upper()
-    kind = (stk_kind or "").upper()
-    return ("ETF" in nm) or ("ETF" in kind)
-
-def get_newly_listed_etfs_for_today_ksd() -> str:
-    if not is_trading_day():
-        return ""
-    now = datetime.now(KST)
-    ymd = now.strftime("%Y%m%d")
-    ymd_dash = now.strftime("%Y-%m-%d")
-    rows = _inquire_ksd_list_info(F_DT=ymd, T_DT=ymd)
-    if not rows:
-        return ""
-    key = f"KSD_ETF_ALERTED_BYDATE:{ymd}"
-    alerted = set(r.smembers(key) or []) if r else set()
-    TAGS = {"레버리지":"레버리지","인버스":"인버스","나스닥":"나스닥","S&P":"S&P","미국":"미국",
-            "2차전지":"2차전지","반도체":"반도체","배당":"배당","원유":"원유","금":"금","중국":"중국","테크":"테크","코스닥":"코스닥"}
-    msgs=[]
-    for it in rows:
+def _save_known_etf_codes(codes: set):
+    """현재 ETF 코드 세트를 Redis에 저장"""
+    if r:
         try:
-            list_dt_norm = _normalize_ymd(it.get("list_dt",""))
-            if list_dt_norm != ymd_dash: 
-                continue
-            name = it.get("isin_name","") or it.get("prdt_name","")
-            code = it.get("sht_cd","") or it.get("pdno","")
-            stk_kind = it.get("stk_kind","")
-            if not _is_etf(name, stk_kind): 
-                continue
-            unique = f"{code}:{ymd}"
-            if unique in alerted: 
-                continue
-            tags = [v for k,v in TAGS.items() if k in name]
-            tag_str = (" | " + ", ".join(tags)) if tags else ""
-            msg = (
-                f"🆕 오늘 상장 ETF\n"
-                f"종목명: {name} ({code}){tag_str}\n"
-                f"상장일: {ymd_dash}\n"
-                f"사유/종류: {it.get('issue_type','')} / {stk_kind}\n"
-                f"상장주식수/총발행/발행가: {it.get('issue_stk_qty','')} / {it.get('tot_issue_stk_qty','')} / {it.get('issue_price','')}"
-            )
-            msgs.append(msg)
-            if r:
-                r.sadd(key, unique); r.expire(key, 30*24*3600)
+            r.set("KNOWN_ETF_CODES", json.dumps(list(codes)))
         except Exception as e:
-            print(f"[ETF 파싱 오류] {e}")
-            continue
+            print(f"[ETF 코드 저장 오류] {e}")
+
+def _tag_etf(name: str) -> str:
+    tags = [v for k, v in ETF_TAGS.items() if k in name]
+    return " | ".join(tags) if tags else ""
+
+def detect_newly_listed_etfs() -> str:
+    """네이버 ETF 목록을 이전 스냅샷과 비교해 신규 ETF 감지"""
+    current_etfs = _fetch_naver_etf_list()
+    if not current_etfs:
+        return ""
+
+    known_codes = _get_known_etf_codes()
+    current_codes = set(current_etfs.keys())
+
+    # 첫 실행이면 스냅샷 저장만 하고 리턴
+    if not known_codes:
+        _save_known_etf_codes(current_codes)
+        print(f"[ETF] 초기 스냅샷 저장: {len(current_codes)}개 ETF")
+        return ""
+
+    new_codes = current_codes - known_codes
+    _save_known_etf_codes(current_codes)
+
+    if not new_codes:
+        return ""
+
+    # 중복 알림 방지
+    ymd = datetime.now(KST).strftime("%Y%m%d")
+    alerted_key = f"ETF_NEW_ALERTED:{ymd}"
+    already_alerted = set(r.smembers(alerted_key) or []) if r else set()
+    new_codes -= already_alerted
+    if not new_codes:
+        return ""
+
+    msgs = []
+    for code in sorted(new_codes):
+        etf = current_etfs.get(code, {})
+        name = etf.get("name", code)
+        tags = _tag_etf(name)
+        price = etf.get("price", 0)
+        market_cap = etf.get("market_cap", 0)
+        nav = etf.get("nav", 0)
+
+        msg = (
+            f"🆕 신규 상장 ETF 감지\n"
+            f"종목명: {name} ({code})"
+            + (f" [{tags}]" if tags else "") +
+            f"\n┗ 현재가: {price:,}원 | 시가총액: {market_cap:,}억원"
+            f"\n┗ NAV: {nav:,.1f}원"
+        )
+        msgs.append(msg)
+        if r:
+            r.sadd(alerted_key, code)
+            r.expire(alerted_key, 7 * 24 * 3600)
+
     return "\n\n".join(msgs) if msgs else ""
+
+def get_weekly_etf_briefing() -> str:
+    """주간 ETF 브리핑: 신규 상장 ETF 감지 + 간단 요약 (매주 첫 거래일)"""
+    current_etfs = _fetch_naver_etf_list()
+    if not current_etfs:
+        return "📊 주간 ETF 브리핑: 데이터 조회 실패"
+
+    now = datetime.now(KST)
+    mon = _monday_of_week(now.date())
+    fri = _friday_of_week(now.date())
+    week_str = f"{mon.strftime('%Y-%m-%d')} ~ {fri.strftime('%Y-%m-%d')}"
+
+    # 신규 ETF 감지
+    new_etf_msg = detect_newly_listed_etfs()
+
+    items = list(current_etfs.values())
+    total_count = len(items)
+
+    # 거래량 TOP 5 (이번주 주목할 ETF)
+    by_volume = sorted(items, key=lambda x: x.get("volume", 0), reverse=True)[:5]
+
+    lines = [f"{'━'*28}", f"📊 [주간 ETF 브리핑] {week_str}"]
+
+    if new_etf_msg:
+        lines.append("")
+        lines.append(new_etf_msg)
+    else:
+        lines.append("\n🆕 신규 상장 ETF: 없음")
+
+    lines.append(f"\n📈 거래량 TOP 5")
+    for i, it in enumerate(by_volume, 1):
+        rate = it.get("change_rate", 0)
+        icon = "🟢" if rate >= 0 else "🔴"
+        lines.append(f"┗ {i}. {icon} {it['name']} | {it['volume']:,}주 | {rate:+.2f}%")
+
+    lines.append(f"\n전체 ETF: {total_count}개")
+    return "\n".join(lines)
+
+def get_monthly_etf_report() -> str:
+    """월간 ETF 수익률 리포트: 3개월 수익률 TOP/WORST (매월 첫 거래일)"""
+    current_etfs = _fetch_naver_etf_list()
+    if not current_etfs:
+        return "📊 월간 ETF 리포트: 데이터 조회 실패"
+
+    now = datetime.now(KST)
+    month_str = now.strftime("%Y년 %m월")
+    items = list(current_etfs.values())
+
+    # 인버스/레버리지 제외한 일반 ETF만 수익률 순위
+    normal_etfs = [it for it in items if not any(kw in it["name"] for kw in ["인버스", "선물인버스"])]
+
+    # 3개월 수익률 TOP 10
+    by_return = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0), reverse=True)[:10]
+    # 3개월 수익률 WORST 10
+    by_loss = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0))[:10]
+    # 시가총액 TOP 10
+    by_mcap = sorted(items, key=lambda x: x.get("market_cap", 0), reverse=True)[:10]
+
+    lines = [f"{'━'*28}", f"📊 [{month_str} ETF 월간 리포트]"]
+
+    lines.append(f"\n🏆 3개월 수익률 TOP 10 (인버스 제외)")
+    for i, it in enumerate(by_return, 1):
+        r3m = it.get("three_month_rate", 0)
+        tags = _tag_etf(it["name"])
+        tag_str = f" [{tags}]" if tags else ""
+        lines.append(f"┗ {i}. 🟢 {it['name']}{tag_str} | {r3m:+.2f}% | {it['market_cap']:,}억원")
+
+    lines.append(f"\n📉 3개월 수익률 WORST 10 (인버스 제외)")
+    for i, it in enumerate(by_loss, 1):
+        r3m = it.get("three_month_rate", 0)
+        tags = _tag_etf(it["name"])
+        tag_str = f" [{tags}]" if tags else ""
+        lines.append(f"┗ {i}. 🔴 {it['name']}{tag_str} | {r3m:+.2f}% | {it['market_cap']:,}억원")
+
+    lines.append(f"\n💰 시가총액 TOP 10")
+    for i, it in enumerate(by_mcap, 1):
+        rate = it.get("change_rate", 0)
+        icon = "🟢" if rate >= 0 else "🔴"
+        lines.append(f"┗ {i}. {icon} {it['name']} | {it['market_cap']:,}억원 | {rate:+.2f}%")
+
+    lines.append(f"\n전체 ETF: {len(items)}개")
+    return "\n".join(lines)
 
 def _monday_of_week(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 def _friday_of_week(d: date) -> date:
     return _monday_of_week(d) + timedelta(days=4)
-
-def get_upcoming_listed_etfs_this_week_ksd(now_dt: datetime = None) -> str:
-    now = now_dt or datetime.now(KST)
-    mon = _monday_of_week(now.date())
-    fri = _friday_of_week(now.date())
-    F_DT = mon.strftime("%Y%m%d"); T_DT = fri.strftime("%Y%m%d")
-    F_dash = mon.strftime("%Y-%m-%d"); T_dash = fri.strftime("%Y-%m-%d")
-    rows = _inquire_ksd_list_info(F_DT=F_DT, T_DT=T_DT)
-    if not rows:
-        return f"🔎 [{F_dash} ~ {T_dash}] 이번 주 상장 예정 ETF 없음"
-    etfs = []
-    for it in rows:
-        name = it.get("isin_name","") or it.get("prdt_name","")
-        stk_kind = it.get("stk_kind","")
-        if not _is_etf(name, stk_kind): 
-            continue
-        dt = _normalize_ymd(it.get("list_dt",""))
-        if not (F_dash <= dt <= T_dash): 
-            continue
-        etfs.append({
-            "date": dt, "code": it.get("sht_cd","") or it.get("pdno",""), "name": name,
-            "issue_type": it.get("issue_type",""), "stk_kind": stk_kind,
-            "issue_qty": it.get("issue_stk_qty",""), "tot_qty": it.get("tot_issue_stk_qty",""),
-            "issue_price": it.get("issue_price","")
-        })
-    if not etfs:
-        return f"🔎 [{F_dash} ~ {T_dash}] 이번 주 상장 예정 ETF 없음"
-    etfs.sort(key=lambda x: x["date"])
-    parts = [f"📅 이번 주 상장 예정 ETF [{F_dash} ~ {T_dash}]"]
-    cur = None
-    for e in etfs:
-        if e["date"] != cur:
-            cur = e["date"]; parts.append(f"\n{cur}")
-        parts.append(
-            f"- {e['name']} ({e['code']})"
-            f"\n  · 사유/종류: {e['issue_type']} / {e['stk_kind']}"
-            f"\n  · 상장주식수/총발행/발행가: {e['issue_qty']} / {e['tot_qty']} / {e['issue_price']}"
-        )
-    return "\n".join(parts)
 
 def _is_first_trading_day_of_week(now_dt: datetime = None) -> bool:
     now = now_dt or datetime.now(KST)
@@ -999,33 +1199,65 @@ def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> s
     return "\n".join(lines)
 
 # ================== 알림 작업 ==================
-def job_weekly_if_first_trading_day_0805():
+def _is_first_trading_day_of_month(now_dt: datetime = None) -> bool:
+    """이번 달 첫 거래일인지 판별"""
+    now = now_dt or datetime.now(KST)
+    if not is_trading_day(now):
+        return False
+    d = date(now.year, now.month, 1)
+    while d < now.date():
+        dt = datetime(d.year, d.month, d.day, tzinfo=KST)
+        if is_trading_day(dt):
+            return False
+        d += timedelta(days=1)
+    return True
+
+def job_weekly_etf_briefing():
+    """매주 첫 거래일 08:10 — 주간 ETF 브리핑 (신규 상장 감지)"""
     now = datetime.now(KST)
     if not _is_first_trading_day_of_week(now):
         return
+    # 중복 방지
     iso = now.isocalendar()
     year_week = f"{iso.year}-W{iso.week}"
     key = f"WEEKLY_ETF_SENT:{year_week}"
-    already = r.get(key) if r else None
-    if already:
+    if r and r.get(key):
         return
-    msg = get_upcoming_listed_etfs_this_week_ksd(now)
-    if msg:
-        send_alert_message(msg)
-        if r:
-            r.set(key, "1", ex=21*24*3600)
+    try:
+        msg = get_weekly_etf_briefing()
+        if msg:
+            send_alert_message(msg)
+            if r:
+                r.set(key, "1", ex=21 * 24 * 3600)
+    except Exception as e:
+        send_alert_message(f"❌ 주간 ETF 브리핑 오류: {e}")
 
-def job_daily_today_etf_plus_foreign_0820():
+def job_monthly_etf_report():
+    """매월 첫 거래일 08:10 — 월간 ETF 수익률 리포트"""
+    now = datetime.now(KST)
+    if not _is_first_trading_day_of_month(now):
+        return
+    key = f"MONTHLY_ETF_SENT:{now.strftime('%Y-%m')}"
+    if r and r.get(key):
+        return
+    try:
+        msg = get_monthly_etf_report()
+        if msg:
+            send_alert_message(msg)
+            if r:
+                r.set(key, "1", ex=45 * 24 * 3600)
+    except Exception as e:
+        send_alert_message(f"❌ 월간 ETF 리포트 오류: {e}")
+
+def job_daily_foreign_trend():
+    """매일 08:20 외국인 수급 추세"""
     if not is_trading_day():
         return
-    etf_msg = get_newly_listed_etfs_for_today_ksd()
     trend_msg = build_foreign_trend_topN(days=7, topn=FOREIGN_TREND_TOPN)
-    if etf_msg and trend_msg:
-        send_alert_message(etf_msg + "\n\n" + trend_msg)
-    elif etf_msg:
-        send_alert_message(etf_msg + "\n\n" + "📈 외국인 수급 추세 데이터 없음(누적 대기)")
+    if trend_msg:
+        send_alert_message(trend_msg)
 
-def job_snapshot_foreign_flow_1541():
+def job_snapshot_foreign_flow():
     try:
         snapshot_foreign_flow_all_codes()
     except Exception as e:
@@ -1033,83 +1265,76 @@ def job_snapshot_foreign_flow_1541():
 
 # ================== 실시간 잔고 변동 루프 ==================
 def check_holdings_change_loop():
-    while True:
+    while not shutdown_event.is_set():
         try:
-            # 국내: 장중에만 체크
             if is_trading_day() and is_market_hour():
                 rep_kr = get_account_profit(only_changes=True)
                 if rep_kr:
                     send_alert_message(rep_kr)
-            # 해외: 24h 체크(빈 문자열 반환이면 전송X)
             rep_ov = get_overseas_account_profit(only_changes=True)
             if rep_ov:
                 send_alert_message(rep_ov)
         except Exception as e:
             send_alert_message(f"❌ 자동 잔고 체크 오류: {e}")
             traceback.print_exc()
-        time.sleep(60)
+        shutdown_event.wait(60)
 
 # ================== 런 ==================
 def get_account_profit_with_yearly_report():
-    main_report = get_account_profit(False)
-    try:
-        profit, rate = get_yearly_realized_profit_2025()
-        yearly = (
-            "\n\n📅 [2025 누적 리포트 (실현 손익 기준)]\n"
-            f"💵 실현 수익금: {profit:,}원\n"
-            f"📈 누적 수익률: {rate:.2f}%"
-        )
-    except Exception as e:
-        yearly = f"\n📅 [2025 누적 리포트 (실현 손익 기준)]\n❌ 누적 수익 조회 실패: {e}"
-    return main_report + yearly
+    """16:00 종합 리포트 — 본문에 이미 누적 수익 포함"""
+    return get_account_profit(False)
 
 def run():
-    send_alert_message("✅ 알림 봇 시작")
+    print(f"[시작] KIS Discord Alert Bot (연도: {current_year()})")
+    send_alert_message(f"✅ 알림 봇 시작 ({current_year()})")
 
-    # 초기 1회: 국내 누적 리포트
+    # 초기 1회: 올해 실현손익 요약
+    year = current_year()
     try:
-        profit, rate = get_yearly_realized_profit_2025()
-        summary = "📅 [2025 누적 리포트 (실현 손익 기준)]\n" f"💵 실현 수익금: {profit:,}원\n" f"📈 누적 수익률: {rate:.2f}%"
+        token = get_kis_access_token()
+        profit, rate = _query_realized_profit_period(token, year_start_date(), datetime.now(KST).strftime("%Y%m%d"))
+        rl_icon = "🟢" if profit >= 0 else "🔴"
+        summary = f"📅 [{year}년 실현 손익]\n┗ {rl_icon} 수익금: {profit:,}원 | 수익률: {rate:+.2f}%"
         send_alert_message(summary)
     except Exception as e:
-        send_alert_message(f"❌ 누적 리포트 조회 실패: {e}")
+        send_alert_message(f"❌ 실현손익 조회 실패: {e}")
 
     # 스케줄
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit(False)))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-    schedule.every().day.at("08:10").do(job_weekly_if_first_trading_day_0805)
-    schedule.every().day.at("08:20").do(job_daily_today_etf_plus_foreign_0820)
-    schedule.every().day.at("15:50").do(job_snapshot_foreign_flow_1541)
+    schedule.every().day.at("08:10").do(job_weekly_etf_briefing)     # 주간 ETF (첫 거래일만)
+    schedule.every().day.at("08:10").do(job_monthly_etf_report)     # 월간 ETF (첫 거래일만)
+    schedule.every().day.at("08:20").do(job_daily_foreign_trend)
+    schedule.every().day.at("15:50").do(job_snapshot_foreign_flow)
 
     # 실시간 잔고 변동 모니터
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
-    # 최초 실행 테스트(스팸 방지: 해외 보유 없으면 보내지 않음)
+    # 최초 실행 테스트
     try:
-        weekly_once = get_upcoming_listed_etfs_this_week_ksd()
-        if weekly_once: send_alert_message("🧪[테스트] " + weekly_once)
-        today_etf = get_newly_listed_etfs_for_today_ksd()
-        trend = build_foreign_trend_topN(days=7, topn=FOREIGN_TREND_TOPN)
+        etf_briefing = get_weekly_etf_briefing()
+        if etf_briefing: send_alert_message("🧪[테스트] " + etf_briefing)
+    except Exception as e:
+        send_alert_message(f"❌ ETF 테스트 실패: {e}")
+    try:
         ovrs_snapshot = get_overseas_account_profit(only_changes=False)
-        combo = []
-        if today_etf: combo.append(today_etf)
-        if trend: combo.append(trend)
-        if ovrs_snapshot: combo.append(ovrs_snapshot)  # 보유 없으면 빈문자열이라 추가 X
-        if combo:
-            send_alert_message("🧪[테스트] " + "\n\n".join(combo))
+        if ovrs_snapshot:
+            send_alert_message("🧪[테스트] " + ovrs_snapshot)
     except Exception as e:
-        send_alert_message(f"❌ 테스트 전송 실패: {e}")
+        send_alert_message(f"❌ 해외잔고 테스트 실패: {e}")
 
-    try:
-        while True:
+    # 메인 루프 (graceful shutdown 지원)
+    while not shutdown_event.is_set():
+        try:
             schedule.run_pending()
-            time.sleep(1)
-    except KeyboardInterrupt:
-        send_alert_message("🛑 알림 봇 종료(수동)")
-    except Exception as e:
-        send_alert_message(f"❌ 알림 루프 오류: {e}")
-        traceback.print_exc()
-        time.sleep(10)
+            shutdown_event.wait(1)
+        except Exception as e:
+            print(f"[스케줄 루프 오류] {e}")
+            traceback.print_exc()
+            shutdown_event.wait(10)
+
+    send_alert_message("🛑 알림 봇 종료")
+    print("[종료] 알림 봇 정상 종료됨")
 
 if __name__ == "__main__":
     run()
