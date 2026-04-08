@@ -24,6 +24,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+DART_API_KEY = os.getenv("DART_API_KEY", "").strip()
 
 # 환율 fallback
 FALLBACK_USDKRW = float(os.getenv("FALLBACK_USDKRW", "1350"))
@@ -965,21 +966,146 @@ def detect_newly_listed_etfs() -> str:
 
     return "\n\n".join(msgs) if msgs else ""
 
+def _fetch_dart_upcoming_etfs(days_back: int = 14) -> List[dict]:
+    """DART 전자공시에서 최근 신규 ETF 일괄신고서 조회 (상장 예정)"""
+    if not DART_API_KEY:
+        return []
+    import re
+    url = "https://opendart.fss.or.kr/api/list.json"
+    now = datetime.now(KST)
+    params = {
+        "crtfc_key": DART_API_KEY,
+        "bgn_de": (now - timedelta(days=days_back)).strftime("%Y%m%d"),
+        "end_de": now.strftime("%Y%m%d"),
+        "pblntf_ty": "G",  # 펀드공시
+        "page_count": 100,
+    }
+    try:
+        res = requests.get(url, params=params, timeout=15).json()
+        if res.get("status") != "000":
+            print(f"[DART API 오류] {res.get('message','')}")
+            return []
+        results = []
+        for item in res.get("list", []):
+            title = item.get("report_nm", "")
+            # 일괄신고서 + 상장지수 + 기재정정 아닌 것 = 신규 ETF 신고
+            if "일괄신고서" in title and "상장지수" in title and "기재정정" not in title:
+                # ETF 이름 추출
+                match = re.search(r"\(([^)]*상장지수[^)]*)\)", title)
+                etf_name = match.group(1) if match else title
+                # 브랜드명 추출 (TIGER, KODEX, ACE 등)
+                brand_match = re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|KOSEF|PLUS|RISE|KIWOOM|파워)", etf_name)
+                brand = brand_match.group(1) if brand_match else ""
+                results.append({
+                    "date": item.get("rcept_dt", ""),
+                    "corp": item.get("corp_name", ""),
+                    "etf_name": etf_name,
+                    "brand": brand,
+                    "title": title,
+                    "rcept_no": item.get("rcept_no", ""),
+                })
+        return results
+    except Exception as e:
+        print(f"[DART 조회 오류] {e}")
+        return []
+
+def get_upcoming_etf_report() -> str:
+    """DART 기반 상장 예정 ETF 리포트"""
+    etfs = _fetch_dart_upcoming_etfs(days_back=21)
+    if not etfs:
+        return ""
+
+    lines = [f"{'━'*28}", f"📋 [상장 예정 ETF] DART 증권신고서 기반"]
+    for e in etfs:
+        dt = f"{e['date'][:4]}.{e['date'][4:6]}.{e['date'][6:]}"
+        tags = _tag_etf(e["etf_name"])
+        # 관련 뉴스
+        news = _search_etf_news(e["etf_name"])
+        lines.append(
+            f"\n🆕 {e['etf_name']}"
+            + (f" [{tags}]" if tags else "")
+            + f"\n┗ 운용사: {e['corp']} | 신고일: {dt}"
+        )
+        if news:
+            lines.append("┗ 관련 뉴스:")
+            for n in news:
+                lines.append(f"  · {n}")
+
+    lines.append(f"\n💡 일괄신고서 접수 후 약 1~2주 내 상장 예정")
+    return "\n".join(lines)
+
+def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
+    """네이버 뉴스에서 ETF 관련 기사 제목 검색"""
+    import re
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    # 브랜드명 + 키워드로 검색
+    brand = re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|RISE|PLUS|KIWOOM)", etf_name)
+    # 핵심 키워드 추출
+    keywords = re.sub(r"(증권|상장지수|투자신탁|주식|채권혼합|액티브|신탁형|\[.*?\]|\(.*?\))", "", etf_name).strip()
+    query = f"{keywords} ETF"
+    try:
+        res = requests.get("https://m.search.naver.com/search.naver",
+            params={"where": "news", "query": query, "sort": "1"},
+            headers=headers, timeout=8)
+        titles = re.findall(r'class=\"api_txt_lines[^\"]*\"[^>]*>([^<]+)<', res.text)
+        # HTML 태그 제거 + 필터
+        clean = []
+        for t in titles:
+            t = re.sub(r'<[^>]+>', '', t).strip()
+            if len(t) > 10 and t not in clean:
+                clean.append(t)
+            if len(clean) >= max_results:
+                break
+        return clean
+    except Exception:
+        return []
+
 def get_new_etf_daily_report() -> str:
-    """매일 신규 상장 ETF 체크 → 상세 리포트 생성"""
+    """매일 신규 상장 ETF 체크 → 상세 리포트 + 관련 뉴스"""
     if not is_trading_day():
         return ""
-    new_msg = detect_newly_listed_etfs()
-    if not new_msg:
+
+    current_etfs = _fetch_naver_etf_list()
+    known_codes = _get_known_etf_codes()
+    current_codes = set(current_etfs.keys())
+
+    if not known_codes or not current_etfs:
+        _save_known_etf_codes(current_codes)
+        return ""
+
+    new_codes = current_codes - known_codes
+    _save_known_etf_codes(current_codes)
+    if not new_codes:
         return ""
 
     today = datetime.now(KST).strftime("%Y-%m-%d")
-    return (
-        f"{'━'*28}\n"
-        f"🆕 [신규 상장 ETF 리포트] {today}\n\n"
-        f"{new_msg}\n\n"
-        f"💡 신규 ETF는 상장 초기 유동성이 낮을 수 있으니 거래량 확인 후 투자를 검토하세요."
-    )
+    lines = [f"{'━'*28}", f"🆕 [신규 상장 ETF 리포트] {today}"]
+
+    for code in sorted(new_codes):
+        etf = current_etfs.get(code, {})
+        name = etf.get("name", code)
+        price = etf.get("price", 0)
+        nav = etf.get("nav", 0)
+        mcap = etf.get("market_cap", 0)
+        volume = etf.get("volume", 0)
+        tags = _tag_etf(name)
+
+        lines.append(
+            f"\n📌 {name} ({code})"
+            + (f" [{tags}]" if tags else "")
+            + f"\n┗ 현재가: {price:,}원 | NAV: {nav:,.1f}원"
+            f"\n┗ 시총: {mcap:,}억원 | 거래량: {volume:,}주"
+        )
+
+        # 관련 뉴스
+        news = _search_etf_news(name)
+        if news:
+            lines.append("┗ 관련 뉴스:")
+            for n in news:
+                lines.append(f"  · {n}")
+
+    lines.append(f"\n💡 신규 ETF는 상장 초기 유동성이 낮을 수 있습니다. 거래량 확인 후 투자를 검토하세요.")
+    return "\n".join(lines)
 
 def _fetch_market_indices() -> str:
     """주요 시장 지수 조회 (네이버 API)"""
@@ -1017,12 +1143,17 @@ def get_weekly_etf_briefing() -> str:
         lines.append(f"\n📈 시장 현황")
         lines.append(indices)
 
-    # 신규 ETF
+    # 신규 ETF (이미 상장된 것)
     new_etf_msg = detect_newly_listed_etfs()
     if new_etf_msg:
         lines.append(f"\n{new_etf_msg}")
     else:
         lines.append("\n🆕 신규 상장 ETF: 없음")
+
+    # 상장 예정 ETF (DART 신고서 기반)
+    upcoming = get_upcoming_etf_report()
+    if upcoming:
+        lines.append(f"\n{upcoming}")
 
     return "\n".join(lines)
 
