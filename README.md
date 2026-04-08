@@ -1,157 +1,119 @@
-# KIS Trading Alert Bot (Discord & Telegram)
+# KIS Trading Alert Bot
 
-한국투자증권 OpenAPI 기반의 실시간 투자 알림 봇.  
-보유 종목 변동, 수익률 리포트, ETF 시장 브리핑, 외국인/기관 수급 등을 Discord + Telegram으로 자동 전송합니다.
-
----
-
-## 주요 기능
-
-### 실시간 잔고 변동 감지
-- **국내**: 장중(09~15시) 60초마다 보유 수량 변화 감지 → 매수/매도 체결 알림
-- **해외**: 24시간 60초마다 보유 변화 감지 (미국/일본/홍콩/중국)
-- 스냅샷 기반 디듀플리케이션으로 중복 알림 방지
-
-### 종합 리포트 (매일 08:30 / 16:00)
-- 보유 종목별 수익률 + 외국인/기관 수급 요약
-- **총 자산**: KIS API `output2` 기반 정확한 총자산 (보유평가 + 예수금)
-- **보유 평가손익**: 투자원금 대비 현재 평가 (매입가 기준)
-- **전일 대비**: 자산 증감
-- **실현손익**: 올해/전체(최대 10년) 매도 확정 수익 (KIS API `TTTC8715R`)
-- **연초 대비 수익률**: Redis 연초 자산 스냅샷 기반 자동 계산
-- **수급 TOP 3**: 당일 외국인/기관 순매수 상위 종목
-
-### ETF 브리핑
-- **주간** (매주 첫 거래일 08:10): 신규 상장 ETF 감지 + 거래량 TOP 5
-- **월간** (매월 첫 거래일 08:10): 3개월 수익률 TOP/WORST 10 + 시가총액 TOP 10
-- 네이버 금융 ETF API 기반 (무료, 키 불필요)
-
-### 외국인 수급 추세 (매일 08:20)
-- Redis에 일자별 외국인 순매수 스냅샷 누적
-- 상승 추세 스코어링 → TOP N 리포트
-
-### 안정성
-- Redis 미사용 시에도 핵심 기능 동작 (스냅샷/캐시 기능만 제한)
-- Discord 2000자 / Telegram 4096자 자동 분할 + Rate Limit 대응
-- Docker SIGTERM/SIGINT 핸들링 (fly.io graceful shutdown)
-- 한국 공휴일 자동 판별 (`holidays` 패키지, 연도 하드코딩 없음)
+한국투자증권 OpenAPI 기반 투자 알림 봇.  
+보유 종목 변동, 자산 리포트, ETF 브리핑, 수급 분석을 **Discord + Telegram**으로 자동 전송합니다.
 
 ---
 
-## 스케줄
+## 어떤 알림을 받을 수 있나요?
 
-| 시간(KST) | 기능 | 주기 |
-|---|---|---|
-| 08:10 | 주간 ETF 브리핑 (신규 상장 감지) | 매주 첫 거래일 |
-| 08:10 | 월간 ETF 수익률 리포트 | 매월 첫 거래일 |
-| 08:20 | 외국인 수급 추세 TOP N | 매일 거래일 |
-| 08:30 | 종합 리포트 (보유종목 + 자산 + 수급 TOP) | 매일 거래일 |
-| 15:50 | 외국인 수급 스냅샷 저장 | 매일 거래일 |
-| 16:00 | 종합 리포트 (보유종목 + 자산 + 실현손익 + 수급 TOP) | 매일 거래일 |
-| 매 60초 | 국내(장중)/해외(24h) 잔고 변동 감지 | 실시간 |
+### 📌 매수/매도 체결 알림 (실시간)
+주식을 사거나 팔면 **60초 이내에 알림**이 옵니다.
+- 국내 주식: 장중(09~15시)에만 감지
+- 해외 주식: 24시간 감지 (미국/일본/홍콩/중국)
+- 수량 변화가 없으면 알림을 보내지 않아 스팸 방지
 
----
+### 📊 매일 받는 리포트
+**매일 아침(08:30)과 장 마감(16:00)에 종합 리포트**를 받습니다.
 
-## 리포트 예시
+리포트에 포함되는 정보:
+- **보유 종목별 수익률** — 평균 매입가 vs 현재가, 손익금, 수익률
+- **외국인/기관 수급** — 종목별 외국인·기관 순매수량 (장 마감 후)
+- **총 자산 현황** — 보유종목 평가 + 예수금 = 총자산
+- **보유 평가손익** — 투자원금 대비 현재 평가 차이
+- **전일 대비 변동** — 어제와 오늘 자산 차이
+- **실현손익** — 매도해서 확정된 순수익 (올해 / 최근 10년)
+- **수급 TOP 3** — 당일 외국인·기관 순매수 상위 종목
 
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💼 [총 자산] 109,087,723원
-┗ 보유종목: 84,891,300원 (원금: 85,004,612원)
-┗ 예수금: 21,377,053원
-┗ 🔴 보유 평가손익: -113,312원 (-0.13%)
-┗ 🟢 전일 대비: +4,822,655원
+### 📈 ETF 브리핑
+- **매주 첫 거래일**: 이번 주 신규 상장 ETF + 거래량 TOP 5
+- **매월 첫 거래일**: 3개월 수익률 TOP/WORST 10 + 시가총액 TOP 10
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 [실현손익] 매도 확정 수익
-┗ 🟢 2026년 (2026.01.01~04.08): 21,784,321원 (+35.58%)
-┗ 🟢 전체 (2016.04.10~04.08): 24,430,042원 (+7.36%)
-```
+### 🌍 외국인 수급 추세 (매일 08:20)
+- 최근 7일간 외국인 순매수가 **꾸준히 증가**하는 종목을 추려서 알림
+- 일별 순매수 데이터를 Redis에 누적하여 추세 스코어링
 
 ---
 
-## 설치
+## 스케줄 요약
 
-### 요구 사항
+| 시간 | 내용 |
+|---|---|
+| 08:10 | 주간 ETF 브리핑 (매주 첫 거래일) |
+| 08:10 | 월간 ETF 리포트 (매월 첫 거래일) |
+| 08:20 | 외국인 수급 추세 TOP |
+| 08:30 | 종합 리포트 + 수급 TOP 3 |
+| 15:50 | 외국인 수급 스냅샷 저장 |
+| 16:00 | 종합 리포트 + 실현손익 + 수급 TOP 3 |
+| 매 60초 | 잔고 변동 감지 (매수/매도 알림) |
+
+---
+
+## 설치 및 실행
+
+### 필요한 것
 - Python 3.10+
-- (선택) Redis 6+ (Upstash 무료 티어 추천)
-- KIS OpenAPI 앱키, Discord Webhook, Telegram Bot/Chat ID
+- KIS OpenAPI 앱키/시크릿 ([한국투자증권 OpenAPI](https://apiportal.koreainvestment.com/))
+- Discord Webhook URL 또는 Telegram Bot Token + Chat ID
+- (선택) Redis — Upstash 무료 티어 추천
 
-### 의존성
+### 설치
 ```bash
+git clone https://github.com/lirongzzuin/KIS_Discord_Alert_Bot.git
+cd KIS_Discord_Alert_Bot
 pip install -r requirements.txt
+cp .env.example .env  # 환경변수 편집
+python kis_discord_alert.py
 ```
 
 ### 환경변수 (.env)
 ```env
-# KIS 인증 (필수)
-KIS_APP_KEY=your_kis_app_key
-KIS_APP_SECRET=your_kis_app_secret
+# 필수
+KIS_APP_KEY=한국투자증권_앱키
+KIS_APP_SECRET=한국투자증권_시크릿
 KIS_ACCOUNT_NO=12345678-01
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
+TELEGRAM_BOT_TOKEN=봇토큰
+TELEGRAM_CHAT_ID=-100채널ID
 
-# 알림 채널 (최소 1개 필수)
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxxx/xxxx
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-TELEGRAM_CHAT_ID=-100xxxxxxxxxx
-
-# Redis (선택 — 스냅샷/캐시/수급추세에 사용)
+# 선택
 REDIS_URL=redis://default:password@host:6379
-```
-
-### 실행
-```bash
-python kis_discord_alert.py
 ```
 
 ---
 
-## fly.io 배포
+## fly.io 배포 (무료)
 
 ```bash
 # 1. 앱 생성
 flyctl apps create kis-discord-alert-bot --org personal
 
-# 2. Redis 생성 (선택)
+# 2. Redis 생성
 flyctl redis create --name kis-alert-redis --region nrt --no-replicas --enable-eviction -o personal
 
 # 3. 시크릿 등록
 flyctl secrets set \
-  KIS_APP_KEY="..." \
-  KIS_APP_SECRET="..." \
-  KIS_ACCOUNT_NO="..." \
-  DISCORD_WEBHOOK_URL="..." \
-  TELEGRAM_BOT_TOKEN="..." \
-  TELEGRAM_CHAT_ID="..." \
-  REDIS_URL="..." \
-  --app kis-discord-alert-bot
+  KIS_APP_KEY="..." KIS_APP_SECRET="..." KIS_ACCOUNT_NO="..." \
+  DISCORD_WEBHOOK_URL="..." TELEGRAM_BOT_TOKEN="..." TELEGRAM_CHAT_ID="..." \
+  REDIS_URL="..." --app kis-discord-alert-bot
 
 # 4. 배포
 flyctl deploy
 
-# 5. 확인
+# 5. 로그 확인
 flyctl logs --app kis-discord-alert-bot --no-tail | tail -20
 ```
 
 ---
 
-## 기술 세부사항
+## 기술 스택
 
-### KIS API 활용
-| API (tr_id) | 용도 |
-|---|---|
-| `TTTC8434R` | 국내 잔고/평가 (output1: 종목별, output2: 계좌요약) |
-| `TTTC8715R` | 기간별 실현손익 (매도 확정, 최대 10년) |
-| `CTRP6504R` | 해외 현재잔고 |
-| `HHDFS00000300` | 환율 조회 |
-| `FHKST01010900` | 종목별 외국인/기관 수급 |
-| `FHPTJ04400000` | 외국인/기관 순매수 종합 (수급 TOP) |
-
-### 수익 계산 방식
-- **보유 평가손익** = 현재 평가금액 - 매입원금 (KIS output2 `evlu_pfls_smtl_amt`)
-- **실현손익** = 매도 확정 순수익 (KIS `TTTC8715R`, 원금 제외)
-- **올해 실현** = 2026.01.01~ 기간 조회
-- **전체 실현** = 최대 10년 기간 조회 (API 제한)
-- **연초 대비** = Redis 자동 저장된 연초 총자산 vs 현재 총자산
+- **Python 3.11** + schedule + requests + redis + holidays
+- **KIS OpenAPI** — 잔고, 실현손익, 수급, 환율 조회
+- **네이버 금융 API** — ETF 전종목 조회 (신규 상장 감지)
+- **Discord Webhook + Telegram Bot API** — 알림 전송
+- **Upstash Redis** — 스냅샷, 캐시, 수급 추세 데이터
+- **fly.io** — 무료 클라우드 배포 (shared-cpu-1x, 256MB)
 
 ---
 
