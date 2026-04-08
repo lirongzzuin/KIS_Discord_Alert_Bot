@@ -1585,7 +1585,7 @@ def run():
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("08:10").do(job_daily_new_etf_check)     # 신규 ETF (1차)
-    schedule.every().day.at("09:30").do(job_daily_new_etf_check)     # 신규 ETF (2차, 장 개시 후)
+    schedule.every().day.at("08:30").do(job_daily_new_etf_check)     # 신규 ETF (2차, 장전시간외)
     schedule.every().day.at("08:10").do(job_weekly_etf_briefing)
     schedule.every().day.at("08:10").do(job_monthly_etf_report)
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
