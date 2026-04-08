@@ -1061,20 +1061,35 @@ def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
         return []
 
 def get_new_etf_daily_report() -> str:
-    """매일 신규 상장 ETF 체크 → 상세 리포트 + 관련 뉴스"""
+    """신규 상장 ETF 감지 → 상세 리포트 + 관련 뉴스"""
     if not is_trading_day():
         return ""
 
     current_etfs = _fetch_naver_etf_list()
+    if not current_etfs:
+        return ""
+
     known_codes = _get_known_etf_codes()
     current_codes = set(current_etfs.keys())
 
-    if not known_codes or not current_etfs:
+    # 첫 실행이면 스냅샷 저장만
+    if not known_codes:
         _save_known_etf_codes(current_codes)
         return ""
 
     new_codes = current_codes - known_codes
+    if not new_codes:
+        # 스냅샷은 신규 발견 시에만 갱신 (장중 재체크 가능하도록)
+        return ""
+
+    # 신규 발견 → 스냅샷 갱신
     _save_known_etf_codes(current_codes)
+
+    # 당일 중복 방지 (Redis)
+    ymd = datetime.now(KST).strftime("%Y%m%d")
+    alerted_key = f"ETF_NEW_DAILY:{ymd}"
+    already = set(r.smembers(alerted_key) or []) if r else set()
+    new_codes -= already
     if not new_codes:
         return ""
 
@@ -1103,6 +1118,10 @@ def get_new_etf_daily_report() -> str:
             lines.append("┗ 관련 뉴스:")
             for n in news:
                 lines.append(f"  · {n}")
+
+        if r:
+            r.sadd(alerted_key, code)
+            r.expire(alerted_key, 3 * 24 * 3600)
 
     lines.append(f"\n💡 신규 ETF는 상장 초기 유동성이 낮을 수 있습니다. 거래량 확인 후 투자를 검토하세요.")
     return "\n".join(lines)
@@ -1565,7 +1584,8 @@ def run():
     # 스케줄 등록
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-    schedule.every().day.at("08:10").do(job_daily_new_etf_check)
+    schedule.every().day.at("08:10").do(job_daily_new_etf_check)     # 신규 ETF (1차)
+    schedule.every().day.at("09:30").do(job_daily_new_etf_check)     # 신규 ETF (2차, 장 개시 후)
     schedule.every().day.at("08:10").do(job_weekly_etf_briefing)
     schedule.every().day.at("08:10").do(job_monthly_etf_report)
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
