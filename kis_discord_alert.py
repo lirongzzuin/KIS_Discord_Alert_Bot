@@ -1029,14 +1029,13 @@ def get_upcoming_etf_report() -> str:
         if news:
             lines.append("┗ 관련 뉴스:")
             for n in news:
-                lines.append(f"  · {n['title']}")
-                lines.append(f"    {n['link']}")
+                lines.append(f"  · {n}")
 
     lines.append(f"\n💡 일괄신고서 접수 후 약 1~2주 내 상장 예정")
     return "\n".join(lines)
 
-def _search_etf_news(etf_name: str, max_results: int = 3) -> List[Dict[str, str]]:
-    """Google News RSS로 ETF 관련 뉴스 검색. [{title, link}] 반환."""
+def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
+    """Google News RSS로 ETF 관련 뉴스 제목 검색."""
     import re as _re
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -1061,17 +1060,18 @@ def _search_etf_news(etf_name: str, max_results: int = 3) -> List[Dict[str, str]
             res = requests.get(url, headers=headers, timeout=8)
             if res.status_code != 200:
                 continue
-            # RSS에서 title + link 추출
-            items_raw = _re.findall(r"<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>", res.text, _re.DOTALL)
+            items_raw = _re.findall(r"<item>.*?<title>(.*?)</title>", res.text, _re.DOTALL)
             results = []
-            for title, link in items_raw:
-                title = _re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title).strip()
-                title = title.split(" - ")[0].strip()  # 언론사명 분리
+            for raw_title in items_raw:
+                title = _re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", raw_title).strip()
                 source = ""
-                if " - " in (_re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", items_raw[0][0]) if items_raw else ""):
-                    pass
+                if " - " in title:
+                    parts = title.rsplit(" - ", 1)
+                    title = parts[0].strip()
+                    source = parts[1].strip()
                 if len(title) > 10 and "Google" not in title:
-                    results.append({"title": title, "link": link.strip()})
+                    entry = f"{title} ({source})" if source else title
+                    results.append(entry)
                 if len(results) >= max_results:
                     break
             if results:
@@ -1137,8 +1137,7 @@ def get_new_etf_daily_report() -> str:
         if news:
             lines.append("┗ 관련 뉴스:")
             for n in news:
-                lines.append(f"  · {n['title']}")
-                lines.append(f"    {n['link']}")
+                lines.append(f"  · {n}")
 
         if r:
             r.sadd(alerted_key, code)
