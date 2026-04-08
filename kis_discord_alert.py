@@ -1029,36 +1029,56 @@ def get_upcoming_etf_report() -> str:
         if news:
             lines.append("┗ 관련 뉴스:")
             for n in news:
-                lines.append(f"  · {n}")
+                lines.append(f"  · {n['title']}")
+                lines.append(f"    {n['link']}")
 
     lines.append(f"\n💡 일괄신고서 접수 후 약 1~2주 내 상장 예정")
     return "\n".join(lines)
 
-def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
-    """네이버 뉴스에서 ETF 관련 기사 제목 검색"""
-    import re
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-    # 브랜드명 + 키워드로 검색
-    brand = re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|RISE|PLUS|KIWOOM)", etf_name)
-    # 핵심 키워드 추출
-    keywords = re.sub(r"(증권|상장지수|투자신탁|주식|채권혼합|액티브|신탁형|\[.*?\]|\(.*?\))", "", etf_name).strip()
-    query = f"{keywords} ETF"
-    try:
-        res = requests.get("https://m.search.naver.com/search.naver",
-            params={"where": "news", "query": query, "sort": "1"},
-            headers=headers, timeout=8)
-        titles = re.findall(r'class=\"api_txt_lines[^\"]*\"[^>]*>([^<]+)<', res.text)
-        # HTML 태그 제거 + 필터
-        clean = []
-        for t in titles:
-            t = re.sub(r'<[^>]+>', '', t).strip()
-            if len(t) > 10 and t not in clean:
-                clean.append(t)
-            if len(clean) >= max_results:
-                break
-        return clean
-    except Exception:
-        return []
+def _search_etf_news(etf_name: str, max_results: int = 3) -> List[Dict[str, str]]:
+    """Google News RSS로 ETF 관련 뉴스 검색. [{title, link}] 반환."""
+    import re as _re
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    # 브랜드명 추출
+    brand_match = _re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|RISE|PLUS|KIWOOM)", etf_name)
+    brand = brand_match.group(1) if brand_match else ""
+
+    # 테마 추출
+    theme = _re.sub(
+        r"(미래에셋|한국투자|삼성|KB|하나|신한|키움|NH|증권|상장지수|투자신탁|주식|채권혼합|액티브|신탁형|\[.*?\]|\(.*?\)|\d+Q?)",
+        "", etf_name
+    ).strip().replace(brand, "").strip()
+
+    queries = [f"{brand} {theme} ETF", f"{theme} ETF 상장"]
+
+    for query in queries:
+        query = query.strip()
+        if len(query) < 5:
+            continue
+        try:
+            url = f"https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code != 200:
+                continue
+            # RSS에서 title + link 추출
+            items_raw = _re.findall(r"<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>", res.text, _re.DOTALL)
+            results = []
+            for title, link in items_raw:
+                title = _re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title).strip()
+                title = title.split(" - ")[0].strip()  # 언론사명 분리
+                source = ""
+                if " - " in (_re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", items_raw[0][0]) if items_raw else ""):
+                    pass
+                if len(title) > 10 and "Google" not in title:
+                    results.append({"title": title, "link": link.strip()})
+                if len(results) >= max_results:
+                    break
+            if results:
+                return results
+        except Exception:
+            continue
+    return []
 
 def get_new_etf_daily_report() -> str:
     """신규 상장 ETF 감지 → 상세 리포트 + 관련 뉴스"""
@@ -1117,7 +1137,8 @@ def get_new_etf_daily_report() -> str:
         if news:
             lines.append("┗ 관련 뉴스:")
             for n in news:
-                lines.append(f"  · {n}")
+                lines.append(f"  · {n['title']}")
+                lines.append(f"    {n['link']}")
 
         if r:
             r.sadd(alerted_key, code)
