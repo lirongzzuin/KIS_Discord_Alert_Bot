@@ -981,41 +981,49 @@ def get_new_etf_daily_report() -> str:
         f"💡 신규 ETF는 상장 초기 유동성이 낮을 수 있으니 거래량 확인 후 투자를 검토하세요."
     )
 
-def get_weekly_etf_briefing() -> str:
-    """주간 ETF 브리핑: 신규 상장 ETF 감지 + 간단 요약 (매주 첫 거래일)"""
-    current_etfs = _fetch_naver_etf_list()
-    if not current_etfs:
-        return "📊 주간 ETF 브리핑: 데이터 조회 실패"
+def _fetch_market_indices() -> str:
+    """주요 시장 지수 조회 (네이버 API)"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    lines = []
+    # KOSPI, KOSDAQ
+    for code, name in [("KOSPI", "코스피"), ("KOSDAQ", "코스닥")]:
+        try:
+            res = requests.get(f"https://m.stock.naver.com/api/index/{code}/basic", headers=headers, timeout=5)
+            if res.status_code == 200:
+                d = res.json()
+                price = d.get("closePrice", "")
+                change = d.get("compareToPreviousClosePrice", "")
+                direction = d.get("compareToPreviousPrice", {}).get("name", "")
+                rate = d.get("fluctuationsRatio", "")
+                icon = "🟢" if direction == "RISING" else "🔴" if direction == "FALLING" else "⚪"
+                sign = "+" if direction == "RISING" else "-" if direction == "FALLING" else ""
+                lines.append(f"┗ {icon} {name}: {price} ({sign}{change}, {sign}{rate}%)")
+        except Exception:
+            pass
+    return "\n".join(lines) if lines else ""
 
+def get_weekly_etf_briefing() -> str:
+    """주간 브리핑: 시장 현황 + 신규 ETF (매주 첫 거래일)"""
     now = datetime.now(KST)
     mon = _monday_of_week(now.date())
     fri = _friday_of_week(now.date())
     week_str = f"{mon.strftime('%Y-%m-%d')} ~ {fri.strftime('%Y-%m-%d')}"
 
-    # 신규 ETF 감지
+    lines = [f"{'━'*28}", f"📊 [주간 브리핑] {week_str}"]
+
+    # 시장 지수
+    indices = _fetch_market_indices()
+    if indices:
+        lines.append(f"\n📈 시장 현황")
+        lines.append(indices)
+
+    # 신규 ETF
     new_etf_msg = detect_newly_listed_etfs()
-
-    items = list(current_etfs.values())
-    total_count = len(items)
-
-    # 거래량 TOP 5 (이번주 주목할 ETF)
-    by_volume = sorted(items, key=lambda x: x.get("volume", 0), reverse=True)[:5]
-
-    lines = [f"{'━'*28}", f"📊 [주간 ETF 브리핑] {week_str}"]
-
     if new_etf_msg:
-        lines.append("")
-        lines.append(new_etf_msg)
+        lines.append(f"\n{new_etf_msg}")
     else:
         lines.append("\n🆕 신규 상장 ETF: 없음")
 
-    lines.append(f"\n📈 거래량 TOP 5")
-    for i, it in enumerate(by_volume, 1):
-        rate = it.get("change_rate", 0)
-        icon = "🟢" if rate >= 0 else "🔴"
-        lines.append(f"┗ {i}. {icon} {it['name']} | {it['volume']:,}주 | {rate:+.2f}%")
-
-    lines.append(f"\n전체 ETF: {total_count}개")
     return "\n".join(lines)
 
 def get_monthly_etf_report() -> str:
@@ -1389,8 +1397,21 @@ def check_holdings_change_loop():
         shutdown_event.wait(60)
 
 # ================== 런 ==================
+def _get_etf_volume_top3() -> str:
+    """ETF 거래량 TOP 3"""
+    etfs = _fetch_naver_etf_list()
+    if not etfs:
+        return ""
+    items = sorted(etfs.values(), key=lambda x: x.get("volume", 0), reverse=True)[:3]
+    lines = [f"{'━'*28}", "📈 [ETF 거래량 TOP 3]"]
+    for i, it in enumerate(items, 1):
+        rate = it.get("change_rate", 0)
+        icon = "🟢" if rate >= 0 else "🔴"
+        lines.append(f"┗ {i}. {icon} {it['name']} | {it['volume']:,}주 | {rate:+.2f}%")
+    return "\n".join(lines)
+
 def get_account_profit_with_yearly_report():
-    """16:00 종합 리포트 — 자산현황 + 수급 TOP"""
+    """종합 리포트 — 자산현황 + 수급 TOP + ETF 거래량"""
     main_report = get_account_profit(False)
     try:
         supply = build_daily_top_supply_demand(topn=3)
@@ -1398,6 +1419,12 @@ def get_account_profit_with_yearly_report():
             main_report += "\n\n" + supply
     except Exception as e:
         main_report += f"\n\n📊 수급 TOP 조회 오류: {e}"
+    try:
+        etf_vol = _get_etf_volume_top3()
+        if etf_vol:
+            main_report += "\n\n" + etf_vol
+    except Exception:
+        pass
     return main_report
 
 def run():
