@@ -722,9 +722,8 @@ def get_account_profit(only_changes=True):
     kr_icon = "🟢" if total_profit >= 0 else "🔴"
     report += (
         f"\n\n{'━'*28}"
-        f"\n{kr_icon} 국내 보유 평가손익 (미실현)"
-        f"\n┗ 평가금액: {total_eval:,}원 | 투자원금: {total_invest:,}원"
-        f"\n┗ 평가수익: {total_profit:,}원 ({kr_unreal_rate:+.2f}%)"
+        f"\n{kr_icon} 국내 평가손익: {total_profit:,}원 ({kr_unreal_rate:+.2f}%)"
+        f"\n┗ 평가: {total_eval:,}원 / 원금: {total_invest:,}원"
     )
 
     # 해외 보유 있으면 표시
@@ -733,57 +732,53 @@ def get_account_profit(only_changes=True):
         ovrs_rate = (ovrs_profit / ovrs_invest * 100) if ovrs_invest else 0.0
         ov_icon = "🟢" if ovrs_profit >= 0 else "🔴"
         report += (
-            f"\n{ov_icon} 해외 보유 평가손익 (미실현)"
-            f"\n┗ 평가금액: {_fmt_amount_won(ovrs_eval)} | 투자원금: {_fmt_amount_won(ovrs_invest)}"
-            f"\n┗ 평가수익: {_fmt_amount_won(ovrs_profit)} ({ovrs_rate:+.2f}%)"
+            f"\n{ov_icon} 해외 평가손익: {_fmt_amount_won(ovrs_profit)} ({ovrs_rate:+.2f}%)"
+            f"\n┗ 평가: {_fmt_amount_won(ovrs_eval)} / 원금: {_fmt_amount_won(ovrs_invest)}"
         )
 
-    # ── 총 자산 현황 ──
+    # ── 총 자산 ──
     report += (
         f"\n\n{'━'*28}"
-        f"\n💼 [총 자산 현황]"
+        f"\n💼 [총 자산] {int(grand_total):,}원"
         f"\n┗ 국내 보유: {total_eval:,}원"
     )
     if ovrs_eval > 0:
         report += f"\n┗ 해외 보유: {_fmt_amount_won(ovrs_eval)}"
+    if cash > 0:
+        report += f"\n┗ 예수금: {cash:,}원"
+
+    # ── 보유 종목 평가손익 (투자원금 대비 현재가) ──
+    total_unrealized = total_profit + int(ovrs_profit)
+    total_invested = total_invest + ovrs_invest
+    total_eval_all = total_eval + ovrs_eval
+    unreal_rate = (total_unrealized / total_invested * 100) if total_invested > 0 else 0.0
+    ur_icon = "🟢" if total_unrealized >= 0 else "🔴"
     report += (
-        f"\n┗ 예수금: {cash:,}원"
-        f"\n┗ 총 자산: {int(grand_total):,}원"
+        f"\n\n{ur_icon} [보유 평가손익] {total_unrealized:,}원 ({unreal_rate:+.2f}%)"
+        f"\n┗ 투자원금: {int(total_invested):,}원 → 현재평가: {int(total_eval_all):,}원"
     )
 
-    # ── 총 누적 수익 (KIS API 기반) ──
-    # 총 누적 = 현재 미실현 손익 + 전체기간 실현손익 (KIS API 10년 제한)
-    total_unrealized = total_profit + int(ovrs_profit)
+    # ── 실현손익 (매도 확정, KIS API) ──
+    now_dt = datetime.now(KST)
+    today_str = now_dt.strftime("%Y%m%d")
+    year = current_year()
+
     try:
-        ten_years_ago = (datetime.now(KST) - timedelta(days=3650)).strftime("%Y%m%d")
-        all_realized, _ = _query_realized_profit_period(token, ten_years_ago, datetime.now(KST).strftime("%Y%m%d"))
-        all_cumulative = total_unrealized + all_realized
-        cum_icon = "🟢" if all_cumulative >= 0 else "🔴"
+        ten_y_dt = now_dt - timedelta(days=3650)
+        all_realized, all_realized_rate = _query_realized_profit_period(token, ten_y_dt.strftime("%Y%m%d"), today_str)
+        year_realized, year_realized_rate = _query_realized_profit_period(token, year_start_date(), today_str)
+
+        all_icon = "🟢" if all_realized >= 0 else "🔴"
+        yr_icon = "🟢" if year_realized >= 0 else "🔴"
+
         report += (
             f"\n\n{'━'*28}"
-            f"\n📊 [총 누적 수익 (전체 기간)]"
-            f"\n┗ 보유종목 평가손익: {total_unrealized:,}원 (미실현)"
-            f"\n┗ 전체 실현손익: {all_realized:,}원 (매도 확정)"
-            f"\n┗ {cum_icon} 총 누적: {all_cumulative:,}원"
+            f"\n💰 [실현손익] 매도 확정 수익"
+            f"\n┗ {yr_icon} {year}년 ({year}.01.01~): {year_realized:,}원 ({year_realized_rate:+.2f}%)"
+            f"\n┗ {all_icon} 전체 ({ten_y_dt.strftime('%Y.%m.%d')}~): {all_realized:,}원 ({all_realized_rate:+.2f}%)"
         )
     except Exception as e:
-        report += f"\n\n📊 총 누적 수익 조회 오류: {e}"
-
-    # ── 올해 누적 수익 (KIS API 기반) ──
-    year = current_year()
-    try:
-        year_realized, year_realized_rate = _query_realized_profit_period(
-            token, year_start_date(), datetime.now(KST).strftime("%Y%m%d"))
-        year_cumulative = total_unrealized + year_realized
-        yr_icon = "🟢" if year_cumulative >= 0 else "🔴"
-        report += (
-            f"\n\n📅 [{year}년 누적 수익]"
-            f"\n┗ 보유종목 평가손익: {total_unrealized:,}원 (미실현)"
-            f"\n┗ {year}년 실현손익: {year_realized:,}원 (매도 확정)"
-            f"\n┗ {yr_icon} {year}년 총 누적: {year_cumulative:,}원"
-        )
-    except Exception as e:
-        report += f"\n\n📅 {year}년 누적 수익 조회 오류: {e}"
+        report += f"\n\n💰 실현손익 조회 오류: {e}"
 
     return report
 
