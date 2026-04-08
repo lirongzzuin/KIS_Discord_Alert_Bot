@@ -1562,45 +1562,34 @@ def run():
     print(f"[시작] KIS Discord Alert Bot (연도: {current_year()})")
     send_alert_message(f"✅ 알림 봇 시작 ({current_year()})")
 
-    # 초기 1회: 올해 실현손익 요약
-    year = current_year()
-    try:
-        token = get_kis_access_token()
-        profit, rate = _query_realized_profit_period(token, year_start_date(), datetime.now(KST).strftime("%Y%m%d"))
-        rl_icon = "🟢" if profit >= 0 else "🔴"
-        summary = f"📅 [{year}년 실현 손익]\n┗ {rl_icon} 수익금: {profit:,}원 | 수익률: {rate:+.2f}%"
-        send_alert_message(summary)
-    except Exception as e:
-        send_alert_message(f"❌ 실현손익 조회 실패: {e}")
-
-    # 스케줄
+    # 스케줄 등록
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
     schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-    schedule.every().day.at("08:10").do(job_daily_new_etf_check)     # 매일: 신규 ETF 상장 리포트
-    schedule.every().day.at("08:10").do(job_weekly_etf_briefing)    # 매주 첫 거래일: 주간 ETF
-    schedule.every().day.at("08:10").do(job_monthly_etf_report)    # 매월 첫 거래일: 월간 ETF
+    schedule.every().day.at("08:10").do(job_daily_new_etf_check)
+    schedule.every().day.at("08:10").do(job_weekly_etf_briefing)
+    schedule.every().day.at("08:10").do(job_monthly_etf_report)
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
     schedule.every().day.at("15:50").do(job_snapshot_foreign_flow)
 
     # 실시간 잔고 변동 모니터
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
-    # 최초 실행: 전체 브리핑
+    # 최초 실행: 전체 브리핑 (시작 메시지와 함께)
     try:
         report = get_account_profit_with_yearly_report()
-        if report: send_alert_message(report)
+        if report:
+            send_alert_message(report)
+            print("[초기] 종합 리포트 전송 완료")
     except Exception as e:
         send_alert_message(f"❌ 종합 리포트 실패: {e}")
+        print(f"[초기] 종합 리포트 실패: {e}")
     try:
-        etf = get_weekly_etf_briefing()
-        if etf: send_alert_message(etf)
+        upcoming = get_upcoming_etf_report()
+        if upcoming:
+            send_alert_message(upcoming)
+            print("[초기] 상장 예정 ETF 전송 완료")
     except Exception as e:
-        send_alert_message(f"❌ ETF 브리핑 실패: {e}")
-    try:
-        trend = build_foreign_trend_topN()
-        if trend: send_alert_message(trend)
-    except Exception as e:
-        send_alert_message(f"❌ 수급 추세 실패: {e}")
+        print(f"[초기] 상장 예정 ETF 실패: {e}")
 
     # 메인 루프 (graceful shutdown 지원)
     while not shutdown_event.is_set():
