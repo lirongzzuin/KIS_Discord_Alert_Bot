@@ -1107,29 +1107,44 @@ def snapshot_foreign_flow_all_codes():
                                                fid_etc_cls="1")
         universe_rows.extend(rows)
         time.sleep(0.25)
-    per_code = {}
+    frgn_per_code = {}
+    orgn_per_code = {}
     for row in universe_rows:
         code = (row.get("mksc_shrn_iscd") or "").strip()
         if not code:
             continue
-        qty = safe_int(row.get("frgn_ntby_qty"))
-        if code not in per_code or qty > per_code[code]:
-            per_code[code] = qty
-    for code, qty in per_code.items():
+        frgn_qty = safe_int(row.get("frgn_ntby_qty"))
+        orgn_qty = safe_int(row.get("orgn_ntby_qty"))
+        if code not in frgn_per_code or frgn_qty > frgn_per_code[code]:
+            frgn_per_code[code] = frgn_qty
+        if code not in orgn_per_code or orgn_qty > orgn_per_code[code]:
+            orgn_per_code[code] = orgn_qty
+    for code, qty in frgn_per_code.items():
         try:
             if r:
                 r.hset(f"FRGN_FLOW:{code}", today, qty)
                 r.expire(f"FRGN_FLOW:{code}", 120*24*3600)
         except Exception as e:
-            print(f"[Redis 기록 오류] {code} / {e}")
+            print(f"[Redis 기록 오류] FRGN {code} / {e}")
+    for code, qty in orgn_per_code.items():
+        try:
+            if r:
+                r.hset(f"ORGN_FLOW:{code}", today, qty)
+                r.expire(f"ORGN_FLOW:{code}", 120*24*3600)
+        except Exception as e:
+            print(f"[Redis 기록 오류] ORGN {code} / {e}")
 
-def _get_foreign_series(code: str, days: int = 7) -> List[Tuple[str,int]]:
+def _get_flow_series(prefix: str, code: str, days: int = 7) -> List[Tuple[str,int]]:
+    """Redis에서 수급 시계열 조회. prefix: 'FRGN_FLOW' 또는 'ORGN_FLOW'"""
     if not r: return []
-    all_kv = r.hgetall(f"FRGN_FLOW:{code}") or {}
+    all_kv = r.hgetall(f"{prefix}:{code}") or {}
     if not all_kv: return []
     items = sorted(((k,v) for k,v in all_kv.items()), key=lambda x: x[0])
     items = items[-days:]
     return [(d, safe_int(v)) for d, v in items]
+
+def _get_foreign_series(code: str, days: int = 7) -> List[Tuple[str,int]]:
+    return _get_flow_series("FRGN_FLOW", code, days)
 
 def _is_sustained_growth(series: List[int]) -> bool:
     if len(series) < 3:
@@ -1161,25 +1176,26 @@ def _lookup_name(code: str) -> str:
         print(f"[inquire-price 오류] {code} / {e}")
     return code
 
-def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> str:
+def _build_trend_section(prefix: str, label: str, days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> str:
+    """수급 추세 TOP N 생성. prefix: 'FRGN_FLOW' 또는 'ORGN_FLOW'"""
     if not r:
-        return "📈 외국인 수급 추세: 저장소(Redis) 미설정"
+        return ""
     codes = []
     try:
         cursor = 0
         while True:
-            cursor, keys = r.scan(cursor=cursor, match="FRGN_FLOW:*", count=500)
+            cursor, keys = r.scan(cursor=cursor, match=f"{prefix}:*", count=500)
             for k in keys:
-                if k.startswith("FRGN_FLOW:"):
-                    codes.append(k.split("FRGN_FLOW:", 1)[1])
+                if k.startswith(f"{prefix}:"):
+                    codes.append(k.split(f"{prefix}:", 1)[1])
             if cursor == 0:
                 break
     except Exception as e:
-        print(f"[Redis scan 오류] {e}")
-        return "📈 외국인 수급 추세: 데이터 없음(스캔 실패)"
+        print(f"[Redis scan 오류] {prefix} / {e}")
+        return ""
     scored = []
     for code in codes:
-        series_kv = _get_foreign_series(code, days=days)
+        series_kv = _get_flow_series(prefix, code, days=days)
         if not series_kv:
             continue
         values = [v for _,v in series_kv]
@@ -1189,14 +1205,22 @@ def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> s
         name = _lookup_name(code)
         scored.append((score, code, name, values))
     if not scored:
-        return "📈 외국인 수급 추세: 조건 충족 종목 없음(데이터 누적 중)"
+        return f"{label}: 조건 충족 종목 없음 (데이터 누적 중)"
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:max(1, topn)]
-    lines = ["📈 최근 7일 외국인 수급 '상승 추세' 종목 TOP"]
+    lines = [f"{label} 최근 {days}일 '상승 추세' TOP"]
     for rank,(score,code,name,vals) in enumerate(top, start=1):
         lastN = ", ".join(f"{v:+,}" for v in vals)
-        lines.append(f"{rank}. {name} ({code}) | 점수: {score:,}\n   일별순매수: [{lastN}]")
+        lines.append(f"┗ {rank}. {name} ({code})\n   일별순매수: [{lastN}]")
     return "\n".join(lines)
+
+def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> str:
+    if not r:
+        return "📈 수급 추세: 저장소(Redis) 미설정"
+    frgn = _build_trend_section("FRGN_FLOW", "🌍 외국인", days, topn)
+    orgn = _build_trend_section("ORGN_FLOW", "🏛️ 기관", days, topn)
+    parts = [p for p in [frgn, orgn] if p]
+    return "\n\n".join(parts) if parts else "📈 수급 추세: 데이터 누적 중"
 
 def build_daily_top_supply_demand(topn: int = 3) -> str:
     """당일 외국인/기관 순매수 TOP 종목"""
@@ -1361,18 +1385,22 @@ def run():
     # 실시간 잔고 변동 모니터
     Thread(target=check_holdings_change_loop, daemon=True).start()
 
-    # 최초 실행 테스트
+    # 최초 실행: 전체 브리핑
     try:
-        etf_briefing = get_weekly_etf_briefing()
-        if etf_briefing: send_alert_message("🧪[테스트] " + etf_briefing)
+        report = get_account_profit_with_yearly_report()
+        if report: send_alert_message(report)
     except Exception as e:
-        send_alert_message(f"❌ ETF 테스트 실패: {e}")
+        send_alert_message(f"❌ 종합 리포트 실패: {e}")
     try:
-        ovrs_snapshot = get_overseas_account_profit(only_changes=False)
-        if ovrs_snapshot:
-            send_alert_message("🧪[테스트] " + ovrs_snapshot)
+        etf = get_weekly_etf_briefing()
+        if etf: send_alert_message(etf)
     except Exception as e:
-        send_alert_message(f"❌ 해외잔고 테스트 실패: {e}")
+        send_alert_message(f"❌ ETF 브리핑 실패: {e}")
+    try:
+        trend = build_foreign_trend_topN()
+        if trend: send_alert_message(trend)
+    except Exception as e:
+        send_alert_message(f"❌ 수급 추세 실패: {e}")
 
     # 메인 루프 (graceful shutdown 지원)
     while not shutdown_event.is_set():
