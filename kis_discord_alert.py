@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from threading import Thread, Event
 from typing import List, Dict, Tuple, Optional
 import holidays
+import re as _re_module
 
 # ================== 환경설정 ==================
 load_dotenv()
@@ -89,6 +90,27 @@ def _chunk_message(content: str, max_len: int) -> List[str]:
     if current:
         chunks.append(current)
     return chunks
+
+def _kis_api_request(method, url, headers, params, timeout=15, max_retries=3, label="KIS API"):
+    """KIS API 호출 + 재시도 (타임아웃/네트워크 오류 시 최대 max_retries회)"""
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method == "GET":
+                res = requests.get(url, headers=headers, params=params, timeout=timeout)
+            else:
+                res = requests.post(url, headers=headers, json=params, timeout=timeout)
+            res.raise_for_status()
+            return res.json()
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(2 * attempt)
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"[{label} 네트워크 오류] {e}")
+        except ValueError:
+            raise Exception(f"[{label} 응답 오류] JSON 포맷이 아님 또는 응답이 없음")
+    raise Exception(f"[{label} 네트워크 오류] {max_retries}회 재시도 실패: {last_err}")
 
 def send_alert_message(content: str):
     if not content:
@@ -331,6 +353,20 @@ def _fmt_price_won(v: float) -> str:
 def _fmt_rate(v: float) -> str:
     try: return f"{v:.2f}%"
     except: return f"{v}%"
+
+def _fmt_won_short(v, sign=False) -> str:
+    """큰 금액을 읽기 쉽게 축약: 1.2억원, 3,450만원, 12,345원"""
+    try:
+        n = int(round(float(v)))
+    except (ValueError, TypeError):
+        return f"{v}원"
+    prefix = "+" if sign and n > 0 else ("-" if n < 0 else "")
+    n = abs(n)
+    if n >= 100_000_000:
+        return f"{prefix}{n / 100_000_000:,.1f}억원"
+    if n >= 10_000:
+        return f"{prefix}{n // 10_000:,}만원"
+    return f"{prefix}{n:,}원"
 
 def _kis_headers(tr_id: str) -> Dict[str, str]:
     token = get_kis_access_token()
@@ -591,10 +627,10 @@ def _query_realized_profit_period(token, start_dt: str, end_dt: str) -> Tuple[in
         "INQR_STRT_DT": start_dt, "INQR_END_DT": end_dt, "CBLC_DVSN": "00",
         "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
     }
-    res = requests.get(url, headers=headers, params=params, timeout=10).json()
-    if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익조회 실패] {res.get('msg1', res)}")
-    output2 = res.get("output2", {})
+    data = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="실현손익조회")
+    if data.get("rt_cd") != "0":
+        raise Exception(f"[실현손익조회 실패] {data.get('msg1', data)}")
+    output2 = data.get("output2", {})
     profit = safe_int(output2.get("tot_rlzt_pfls", "0"))
     rate = safe_float(output2.get("tot_pftrt", "0"))
     return profit, rate
@@ -651,7 +687,7 @@ def get_account_profit(only_changes=True):
         "AFHR_FLPR_YN": "N", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "OFL_YN": "N",
         "PRCS_DVSN": "00", "CTX_AREA_FK100": "P", "CTX_AREA_NK100": ""
     }
-    res = requests.get(url, headers=headers, params=params, timeout=10).json()
+    res = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="잔고 API")
     if res.get("rt_cd") != "0":
         raise Exception(f"[잔고 API 실패] {res.get('msg1', res)}")
     output = res.get("output1", [])
@@ -720,16 +756,17 @@ def get_account_profit(only_changes=True):
     save_initial_assets_if_needed(int(grand_total))
 
     # ── 보유 종목 리포트 ──
+    now_ts = datetime.now(KST).strftime("%m/%d %H:%M")
     report = ""
     if changes: report += "📌 [국내 잔고 변동]\n" + "\n".join(changes) + "\n\n"
-    report += f"{'━'*28}\n📊 [국내 보유 종목]"
+    report += f"{'━'*28}\n📊 [국내 보유 종목] {now_ts} 기준"
     for it in parsed_items:
         status_icon = "🟢" if it['profit'] >= 0 else "🔴"
         report += (
-            f"\n{status_icon} {it['name']}\n"
-            f"┗ {it['qty']}주 | 평균: {int(it['avg']):,}원 → 현재: {int(it['cur']):,}원\n"
-            f"┗ 평가: {it['eval']:,}원 | 손익: {it['profit']:,}원 ({it['rate']:+.2f}%)"
-            + (f"\n┗ {it['flow']}" if it["flow"] else "")
+            f"\n{status_icon} {it['name']} ({it['qty']}주)"
+            f"\n  평균 {int(it['avg']):,} → 현재 {int(it['cur']):,}원"
+            f"\n  평가 {_fmt_won_short(it['eval'])} | {status_icon} {it['profit']:+,}원 ({it['rate']:+.2f}%)"
+            + (f"\n  {it['flow']}" if it["flow"] else "")
         )
 
     # 해외 보유 있으면 표시
@@ -748,15 +785,15 @@ def get_account_profit(only_changes=True):
 
     report += (
         f"\n\n{'━'*28}"
-        f"\n💼 [총 자산] {int(grand_total):,}원"
-        f"\n┗ 보유종목: {kr_eval_total:,}원 (원금: {kr_buy_total:,}원)"
-        f"\n┗ 예수금: {cash:,}원"
+        f"\n💼 [총 자산] {_fmt_won_short(grand_total)}"
+        f"\n  국내 보유 {_fmt_won_short(kr_eval_total)} (원금 {_fmt_won_short(kr_buy_total)})"
+        f"\n  예수금 {_fmt_won_short(cash)}"
     )
     if ovrs_eval > 0:
-        report += f"\n┗ 해외: {_fmt_amount_won(ovrs_eval)}"
+        report += f"\n  해외 {_fmt_won_short(ovrs_eval)}"
     report += (
-        f"\n┗ {kr_pl_icon} 보유 평가손익: {kr_pl_total:,}원 ({kr_pl_rate:+.2f}%)"
-        f"\n┗ {day_icon} 전일 대비: {day_change:+,}원"
+        f"\n  {kr_pl_icon} 평가손익 {_fmt_won_short(kr_pl_total, sign=True)} ({kr_pl_rate:+.2f}%)"
+        f"\n  {day_icon} 전일비 {_fmt_won_short(day_change, sign=True)}"
     )
 
     # ── 실현손익 (매도 확정, KIS API TTTC8715R) ──
@@ -774,9 +811,9 @@ def get_account_profit(only_changes=True):
 
         report += (
             f"\n\n{'━'*28}"
-            f"\n💰 [실현손익] 매도 확정 수익"
-            f"\n┗ {yr_icon} {year}년 ({year}.01.01~{now_dt.strftime('%m.%d')}): {year_realized:,}원 ({year_realized_rate:+.2f}%)"
-            f"\n┗ {all_icon} 전체 ({ten_y_dt.strftime('%Y.%m.%d')}~{now_dt.strftime('%m.%d')}): {all_realized:,}원 ({all_realized_rate:+.2f}%)"
+            f"\n💰 [실현손익] 매도 확정"
+            f"\n  {yr_icon} {year}년 누적: {_fmt_won_short(year_realized, sign=True)} ({year_realized_rate:+.2f}%)"
+            f"\n  {all_icon} 전체 누적: {_fmt_won_short(all_realized, sign=True)} ({all_realized_rate:+.2f}%)"
         )
     except Exception as e:
         report += f"\n\n💰 실현손익 조회 오류: {e}"
@@ -800,9 +837,9 @@ def get_account_profit(only_changes=True):
         ytd_rate = (ytd_profit / estimated_initial * 100) if estimated_initial > 0 else 0.0
         ytd_icon = "🟢" if ytd_profit >= 0 else "🔴"
         report += (
-            f"\n\n📅 [{year}년 자산 수익률] {year}.01.01 ~ {now_dt.strftime('%m.%d')}"
-            f"\n┗ 연초: {estimated_initial:,}원 → 현재: {int(grand_total):,}원"
-            f"\n┗ {ytd_icon} 변동: {ytd_profit:+,}원 ({ytd_rate:+.2f}%)"
+            f"\n\n📅 [{year}년 수익률] {year}.01 ~ {now_dt.strftime('%m.%d')}"
+            f"\n  연초 {_fmt_won_short(estimated_initial)} → 현재 {_fmt_won_short(grand_total)}"
+            f"\n  {ytd_icon} {_fmt_won_short(ytd_profit, sign=True)} ({ytd_rate:+.2f}%)"
         )
     except Exception as e:
         report += f"\n\n📅 올해 자산 수익률 계산 오류: {e}"
@@ -823,13 +860,7 @@ def get_realized_holdings_data():
         "FNCG_AMT_AUTO_RDPT_YN": "N","PRCS_DVSN": "00","COST_ICLD_YN": "N",
         "CTX_AREA_FK100": "","CTX_AREA_NK100": ""
     }
-    try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
-        res.raise_for_status(); data = res.json()
-    except requests.exceptions.RequestException as e:
-        raise Exception(f"[실현손익 API 네트워크 오류] {e}")
-    except ValueError:
-        raise Exception("[실현손익 API 응답 오류] JSON 포맷이 아님 또는 응답이 없음")
+    data = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="실현손익 API")
     if data.get("rt_cd") != "0":
         raise Exception(f"[실현손익 API 실패] {data.get('msg1', data)}")
     output1 = data.get("output1", []); result = {}
@@ -852,10 +883,10 @@ def get_yearly_realized_profit():
         "INQR_STRT_DT": start_dt,"INQR_END_DT": end_dt,"CBLC_DVSN": "00",
         "CTX_AREA_FK100": "","CTX_AREA_NK100": ""
     }
-    res = requests.get(url, headers=headers, params=params, timeout=10).json()
-    if res.get("rt_cd") != "0":
-        raise Exception(f"[실현손익조회 실패] {res.get('msg1', res)}")
-    output2 = res.get("output2", {})
+    data = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="연간 실현손익")
+    if data.get("rt_cd") != "0":
+        raise Exception(f"[실현손익조회 실패] {data.get('msg1', data)}")
+    output2 = data.get("output2", {})
     realized_profit = safe_int(output2.get("tot_rlzt_pfls","0"))
     realized_rate = safe_float(output2.get("tot_pftrt","0"))
     return realized_profit, realized_rate
@@ -973,8 +1004,65 @@ def detect_newly_listed_etfs() -> str:
 
     return "\n\n".join(msgs) if msgs else ""
 
+def _parse_listing_date_from_dart(rcept_no: str) -> str:
+    """DART 일괄신고서 '상장 및 매매에 관한 사항' 섹션에서 상장예정일 추출.
+    반환: 'YYYYMMDD' 형식 문자열 또는 빈 문자열."""
+    try:
+        # 1) 문서 메타 페이지에서 dcmNo, eleId 추출
+        meta_url = f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}"
+        meta_res = requests.get(meta_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        # makeToc에서 첫 번째 dcmNo 추출 (정확한 문서번호)
+        dcm_match = _re_module.search(r"node\d+\['dcmNo'\]\s*=\s*['\"](\d+)", meta_res.text)
+        if not dcm_match:
+            return ""
+        dcm_no = dcm_match.group(1)
+
+        # 상장 관련 섹션의 eleId 찾기
+        texts = _re_module.findall(r"node\d+\['text'\]\s*=\s*['\"]([^'\"]+)", meta_res.text)
+        ele_ids = _re_module.findall(r"node\d+\['eleId'\]\s*=\s*['\"](\d+)", meta_res.text)
+        listing_ele = "11"  # 기본값
+        for t, e in zip(texts, ele_ids):
+            if "상장" in t and "매매" in t:
+                listing_ele = e
+                break
+
+        # 2) 상장 및 매매에 관한 사항 섹션 가져오기
+        viewer_url = (
+            f"https://dart.fss.or.kr/report/viewer.do"
+            f"?rcpNo={rcept_no}&dcmNo={dcm_no}&eleId={listing_ele}&offset=0&length=0&dtd=dart4.xsd"
+        )
+        doc_res = requests.get(viewer_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
+        text = doc_res.text
+
+        # 3) 상장예정일 추출 — HTML 테이블 구조 파싱
+        # 패턴: "상장(예정)일</TD> <TD...>2026. 4. 28</TD>" (테이블 셀 분리)
+        td_pat = _re_module.search(
+            r"상장\(?예정\)?일\s*</\s*T[DH]>\s*<T[DH][^>]*>\s*(\d{4})\s*[년.\s]+\s*(\d{1,2})\s*[월.\s]+\s*(\d{1,2})",
+            text, _re_module.IGNORECASE
+        )
+        if td_pat:
+            return f"{td_pat.group(1)}{int(td_pat.group(2)):02d}{int(td_pat.group(3)):02d}"
+
+        # 인라인 텍스트 패턴 (같은 셀 안에 날짜가 있는 경우)
+        # HTML 태그 제거 후 검색
+        clean = _re_module.sub(r"<[^>]+>", " ", text)
+        clean = _re_module.sub(r"&nbsp;", " ", clean)
+        inline_patterns = [
+            r"상장\(?예정\)?일[^\d]*(\d{4})\s*[년.\s]+\s*(\d{1,2})\s*[월.\s]+\s*(\d{1,2})",
+            r"상장예정일[^\d]*(\d{4})\s*[년.\s]+\s*(\d{1,2})\s*[월.\s]+\s*(\d{1,2})",
+            r"상장일[^\d]*(\d{4})\s*[년.\s]+\s*(\d{1,2})\s*[월.\s]+\s*(\d{1,2})",
+        ]
+        for pat in inline_patterns:
+            m = _re_module.search(pat, clean)
+            if m:
+                return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+        return ""
+    except Exception as e:
+        print(f"[DART 상장일 파싱 오류] {rcept_no}: {e}")
+        return ""
+
 def _fetch_dart_upcoming_etfs(days_back: int = 14) -> List[dict]:
-    """DART 전자공시에서 최근 신규 ETF 일괄신고서 조회 (상장 예정)"""
+    """DART 전자공시에서 최근 신규 ETF 일괄신고서 조회 (상장 예정) + 상장예정일 추출"""
     if not DART_API_KEY:
         return []
     import re
@@ -1003,13 +1091,29 @@ def _fetch_dart_upcoming_etfs(days_back: int = 14) -> List[dict]:
                 # 브랜드명 추출 (TIGER, KODEX, ACE 등)
                 brand_match = re.search(r"(TIGER|KODEX|ACE|KBSTAR|SOL|ARIRANG|HANARO|KOSEF|PLUS|RISE|KIWOOM|파워)", etf_name)
                 brand = brand_match.group(1) if brand_match else ""
+                rcept_no = item.get("rcept_no", "")
+
+                # Redis 캐시 확인 (상장예정일)
+                cache_key = f"DART_LISTING_DATE:{rcept_no}"
+                listing_date = ""
+                if r:
+                    cached = r.get(cache_key)
+                    if cached:
+                        listing_date = cached if isinstance(cached, str) else cached.decode()
+                if not listing_date:
+                    listing_date = _parse_listing_date_from_dart(rcept_no)
+                    if listing_date and r:
+                        r.set(cache_key, listing_date, ex=60 * 24 * 3600)  # 60일 캐시
+                    time.sleep(0.3)  # DART 서버 부하 방지
+
                 results.append({
                     "date": item.get("rcept_dt", ""),
                     "corp": item.get("corp_name", ""),
                     "etf_name": etf_name,
                     "brand": brand,
                     "title": title,
-                    "rcept_no": item.get("rcept_no", ""),
+                    "rcept_no": rcept_no,
+                    "listing_date": listing_date,  # YYYYMMDD 또는 ""
                 })
         return results
     except Exception as e:
@@ -1017,8 +1121,14 @@ def _fetch_dart_upcoming_etfs(days_back: int = 14) -> List[dict]:
         return []
 
 def get_upcoming_etf_report() -> str:
-    """DART 기반 상장 예정 ETF 리포트"""
-    etfs = _fetch_dart_upcoming_etfs(days_back=21)
+    """DART 기반 상장 예정 ETF 리포트 (정확한 상장예정일 포함)"""
+    etfs = _fetch_dart_upcoming_etfs(days_back=30)
+    if not etfs:
+        return ""
+
+    now_str = datetime.now(KST).strftime("%Y%m%d")
+    # 이미 상장된 ETF 제외 (상장예정일이 과거인 것)
+    etfs = [e for e in etfs if not e["listing_date"] or e["listing_date"] >= now_str]
     if not etfs:
         return ""
 
@@ -1026,19 +1136,95 @@ def get_upcoming_etf_report() -> str:
     for e in etfs:
         dt = f"{e['date'][:4]}.{e['date'][4:6]}.{e['date'][6:]}"
         tags = _tag_etf(e["etf_name"])
-        # 관련 뉴스
+        # 상장예정일 포맷
+        if e["listing_date"]:
+            ld = e["listing_date"]
+            listing_str = f"{ld[:4]}.{ld[4:6]}.{ld[6:]}"
+        else:
+            listing_str = "미정"
         news = _search_etf_news(e["etf_name"])
         lines.append(
             f"\n🆕 {e['etf_name']}"
             + (f" [{tags}]" if tags else "")
             + f"\n┗ 운용사: {e['corp']} | 신고일: {dt}"
+            + f"\n┗ 📅 상장예정일: {listing_str}"
         )
         if news:
             lines.append("┗ 관련 뉴스:")
             for n in news:
                 lines.append(f"  · {n}")
 
-    lines.append(f"\n💡 일괄신고서 접수 후 약 1~2주 내 상장 예정")
+    return "\n".join(lines)
+
+def _get_etfs_listing_this_week() -> List[dict]:
+    """금주 상장 예정인 ETF 목록 반환"""
+    now = datetime.now(KST)
+    mon = _monday_of_week(now.date())
+    fri = _friday_of_week(now.date())
+    mon_str = mon.strftime("%Y%m%d")
+    fri_str = fri.strftime("%Y%m%d")
+    etfs = _fetch_dart_upcoming_etfs(days_back=45)
+    return [e for e in etfs if e.get("listing_date") and mon_str <= e["listing_date"] <= fri_str]
+
+def _get_etfs_listing_today() -> List[dict]:
+    """오늘 상장 예정인 ETF 목록 반환"""
+    today_str = datetime.now(KST).strftime("%Y%m%d")
+    etfs = _fetch_dart_upcoming_etfs(days_back=45)
+    return [e for e in etfs if e.get("listing_date") == today_str]
+
+def get_weekly_listing_etf_report() -> str:
+    """금주 상장 예정 ETF 요약 리포트 (주간 첫 거래일 발송)"""
+    etfs = _get_etfs_listing_this_week()
+    if not etfs:
+        return ""
+    now = datetime.now(KST)
+    mon = _monday_of_week(now.date())
+    fri = _friday_of_week(now.date())
+    week_str = f"{mon.strftime('%m/%d')}~{fri.strftime('%m/%d')}"
+
+    lines = [f"{'━'*28}", f"📅 [금주 상장 ETF] {week_str}"]
+    for e in etfs:
+        ld = e["listing_date"]
+        listing_str = f"{ld[:4]}.{ld[4:6]}.{ld[6:]}"
+        # 요일 계산
+        ld_date = date(int(ld[:4]), int(ld[4:6]), int(ld[6:]))
+        weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][ld_date.weekday()]
+        tags = _tag_etf(e["etf_name"])
+        news = _search_etf_news(e["etf_name"])
+        lines.append(
+            f"\n🆕 {e['etf_name']}"
+            + (f" [{tags}]" if tags else "")
+            + f"\n┗ 운용사: {e['corp']}"
+            + f"\n┗ 📅 상장일: {listing_str} ({weekday_kr})"
+        )
+        if news:
+            lines.append("┗ 관련 뉴스:")
+            for n in news:
+                lines.append(f"  · {n}")
+    lines.append(f"\n💡 상장 당일 장 시작 전 리마인드 알림이 발송됩니다.")
+    return "\n".join(lines)
+
+def get_today_listing_etf_reminder() -> str:
+    """오늘 상장 ETF 리마인드 알림 (상장 당일 08:10 발송)"""
+    etfs = _get_etfs_listing_today()
+    if not etfs:
+        return ""
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    lines = [f"{'━'*28}", f"🔔 [오늘 상장 ETF 리마인드] {today}"]
+    for e in etfs:
+        tags = _tag_etf(e["etf_name"])
+        news = _search_etf_news(e["etf_name"])
+        lines.append(
+            f"\n🚀 {e['etf_name']}"
+            + (f" [{tags}]" if tags else "")
+            + f"\n┗ 운용사: {e['corp']}"
+            + f"\n┗ 📅 오늘 상장! 09:00 거래 시작"
+        )
+        if news:
+            lines.append("┗ 관련 뉴스:")
+            for n in news:
+                lines.append(f"  · {n}")
+    lines.append(f"\n💡 상장 초기 유동성이 낮을 수 있습니다. 거래량 확인 후 투자를 검토하세요.")
     return "\n".join(lines)
 
 def _search_etf_news(etf_name: str, max_results: int = 3) -> List[str]:
@@ -1175,7 +1361,7 @@ def _fetch_market_indices() -> str:
                 rate = d.get("fluctuationsRatio", "")
                 icon = "🟢" if direction == "RISING" else "🔴" if direction == "FALLING" else "⚪"
                 sign = "+" if direction == "RISING" else "-" if direction == "FALLING" else ""
-                lines.append(f"┗ {icon} {name}: {price} ({sign}{change}, {sign}{rate}%)")
+                lines.append(f"  {icon} {name} {price} ({sign}{change}, {sign}{rate}%)")
         except Exception:
             pass
     return "\n".join(lines) if lines else ""
@@ -1185,9 +1371,9 @@ def get_weekly_etf_briefing() -> str:
     now = datetime.now(KST)
     mon = _monday_of_week(now.date())
     fri = _friday_of_week(now.date())
-    week_str = f"{mon.strftime('%Y-%m-%d')} ~ {fri.strftime('%Y-%m-%d')}"
+    week_str = f"{mon.strftime('%m/%d')}~{fri.strftime('%m/%d')}"
 
-    lines = [f"{'━'*28}", f"📊 [주간 브리핑] {week_str}"]
+    lines = [f"{'━'*28}", f"📊 [주간 ETF 브리핑] {week_str}"]
 
     # 시장 지수
     indices = _fetch_market_indices()
@@ -1195,14 +1381,29 @@ def get_weekly_etf_briefing() -> str:
         lines.append(f"\n📈 시장 현황")
         lines.append(indices)
 
+    # 금주 상장 ETF (정확한 상장예정일)
+    this_week_etfs = _get_etfs_listing_this_week()
+    if this_week_etfs:
+        lines.append(f"\n🗓️ 금주 상장 예정")
+        for e in this_week_etfs:
+            ld = e["listing_date"]
+            ld_date = date(int(ld[:4]), int(ld[4:6]), int(ld[6:]))
+            weekday_kr = ["월", "화", "수", "목", "금", "토", "일"][ld_date.weekday()]
+            tags = _tag_etf(e["etf_name"])
+            lines.append(
+                f"  🆕 {e['etf_name']}"
+                + (f" [{tags}]" if tags else "")
+                + f"\n     {ld[4:6]}/{ld[6:]}({weekday_kr}) | {e['corp']}"
+            )
+    else:
+        lines.append(f"\n🗓️ 금주 상장 예정: 없음")
+
     # 신규 ETF (이미 상장된 것)
     new_etf_msg = detect_newly_listed_etfs()
     if new_etf_msg:
         lines.append(f"\n{new_etf_msg}")
-    else:
-        lines.append("\n🆕 신규 상장 ETF: 없음")
 
-    # 상장 예정 ETF (DART 신고서 기반)
+    # 상장 예정 ETF (DART 신고서 기반 — 향후 예정)
     upcoming = get_upcoming_etf_report()
     if upcoming:
         lines.append(f"\n{upcoming}")
@@ -1222,36 +1423,28 @@ def get_monthly_etf_report() -> str:
     # 인버스/레버리지 제외한 일반 ETF만 수익률 순위
     normal_etfs = [it for it in items if not any(kw in it["name"] for kw in ["인버스", "선물인버스"])]
 
-    # 3개월 수익률 TOP 10
-    by_return = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0), reverse=True)[:10]
-    # 3개월 수익률 WORST 10
-    by_loss = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0))[:10]
-    # 시가총액 TOP 10
-    by_mcap = sorted(items, key=lambda x: x.get("market_cap", 0), reverse=True)[:10]
+    # 3개월 수익률 TOP 5
+    by_return = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0), reverse=True)[:5]
+    # 3개월 수익률 WORST 5
+    by_loss = sorted(normal_etfs, key=lambda x: x.get("three_month_rate", 0))[:5]
 
     lines = [f"{'━'*28}", f"📊 [{month_str} ETF 월간 리포트]"]
 
-    lines.append(f"\n🏆 3개월 수익률 TOP 10 (인버스 제외)")
+    lines.append(f"\n🏆 3개월 수익률 TOP 5")
     for i, it in enumerate(by_return, 1):
         r3m = it.get("three_month_rate", 0)
         tags = _tag_etf(it["name"])
         tag_str = f" [{tags}]" if tags else ""
-        lines.append(f"┗ {i}. 🟢 {it['name']}{tag_str} | {r3m:+.2f}% | {it['market_cap']:,}억원")
+        lines.append(f"  {i}. 🟢 {it['name']}{tag_str}  {r3m:+.2f}%")
 
-    lines.append(f"\n📉 3개월 수익률 WORST 10 (인버스 제외)")
+    lines.append(f"\n📉 3개월 수익률 WORST 5")
     for i, it in enumerate(by_loss, 1):
         r3m = it.get("three_month_rate", 0)
         tags = _tag_etf(it["name"])
         tag_str = f" [{tags}]" if tags else ""
-        lines.append(f"┗ {i}. 🔴 {it['name']}{tag_str} | {r3m:+.2f}% | {it['market_cap']:,}억원")
+        lines.append(f"  {i}. 🔴 {it['name']}{tag_str}  {r3m:+.2f}%")
 
-    lines.append(f"\n💰 시가총액 TOP 10")
-    for i, it in enumerate(by_mcap, 1):
-        rate = it.get("change_rate", 0)
-        icon = "🟢" if rate >= 0 else "🔴"
-        lines.append(f"┗ {i}. {icon} {it['name']} | {it['market_cap']:,}억원 | {rate:+.2f}%")
-
-    lines.append(f"\n전체 ETF: {len(items)}개")
+    lines.append(f"\n📌 전체 ETF {len(items)}개 (인버스 제외 기준)")
     return "\n".join(lines)
 
 def _monday_of_week(d: date) -> date:
@@ -1429,10 +1622,21 @@ def _build_trend_section(prefix: str, label: str, days: int = 7, topn: int = FOR
         return f"{label}: 조건 충족 종목 없음 (데이터 누적 중)"
     scored.sort(key=lambda x: x[0], reverse=True)
     top = scored[:max(1, topn)]
-    lines = [f"{label} 최근 {days}일 '상승 추세' TOP"]
+    lines = [f"{label} 최근 {days}일 상승 추세 TOP"]
     for rank,(score,code,name,vals) in enumerate(top, start=1):
-        lastN = ", ".join(f"{v:+,}" for v in vals)
-        lines.append(f"┗ {rank}. {name} ({code})\n   일별순매수: [{lastN}]")
+        # 미니 트렌드 바: ▁▂▃▅▇ 또는 ▼ 로 시각화
+        trend_chars = []
+        max_v = max(abs(v) for v in vals) if vals else 1
+        for v in vals:
+            if v <= 0:
+                trend_chars.append("▼")
+            else:
+                level = int(v / max(max_v, 1) * 4)
+                trend_chars.append(["▁","▂","▃","▅","▇"][min(level, 4)])
+        trend_bar = "".join(trend_chars)
+        total = sum(v for v in vals)
+        lines.append(f"  {rank}. {name} ({code})")
+        lines.append(f"     {trend_bar}  합계 {total:+,}주")
     return "\n".join(lines)
 
 def build_foreign_trend_topN(days: int = 7, topn: int = FOREIGN_TREND_TOPN) -> str:
@@ -1479,11 +1683,11 @@ def build_daily_top_supply_demand(topn: int = 3) -> str:
     lines.append(f"\n🌍 외국인 순매수")
     for i, it in enumerate(frgn_buy, 1):
         icon = "🟢" if it["frgn"] > 0 else "🔴"
-        lines.append(f"┗ {i}. {icon} {it['name']} | {it['frgn']:+,}주")
+        lines.append(f"  {i}. {icon} {it['name']}  {it['frgn']:+,}주")
     lines.append(f"\n🏛️ 기관 순매수")
     for i, it in enumerate(orgn_buy, 1):
         icon = "🟢" if it["orgn"] > 0 else "🔴"
-        lines.append(f"┗ {i}. {icon} {it['name']} | {it['orgn']:+,}주")
+        lines.append(f"  {i}. {icon} {it['name']}  {it['orgn']:+,}주")
 
     return "\n".join(lines)
 
@@ -1531,6 +1735,41 @@ def job_daily_new_etf_check():
             send_alert_message(msg)
     except Exception as e:
         send_alert_message(f"❌ 신규 ETF 체크 오류: {e}")
+
+def job_weekly_listing_etf():
+    """매주 첫 거래일 08:10 — 금주 상장 예정 ETF 알림"""
+    now = datetime.now(KST)
+    if not _is_first_trading_day_of_week(now):
+        return
+    iso = now.isocalendar()
+    key = f"WEEKLY_LISTING_ETF:{iso.year}-W{iso.week}"
+    if r and r.get(key):
+        return
+    try:
+        msg = get_weekly_listing_etf_report()
+        if msg:
+            send_alert_message(msg)
+            if r:
+                r.set(key, "1", ex=14 * 24 * 3600)
+    except Exception as e:
+        send_alert_message(f"❌ 금주 상장 ETF 알림 오류: {e}")
+
+def job_today_listing_etf_reminder():
+    """매일 08:10 — 오늘 상장 ETF 리마인드 (요일 무관, 거래일만)"""
+    if not is_trading_day():
+        return
+    ymd = datetime.now(KST).strftime("%Y%m%d")
+    key = f"LISTING_REMIND:{ymd}"
+    if r and r.get(key):
+        return
+    try:
+        msg = get_today_listing_etf_reminder()
+        if msg:
+            send_alert_message(msg)
+            if r:
+                r.set(key, "1", ex=3 * 24 * 3600)
+    except Exception as e:
+        send_alert_message(f"❌ 상장 리마인드 오류: {e}")
 
 def job_monthly_etf_report():
     """매월 첫 거래일 08:10 — 월간 ETF 수익률 리포트"""
@@ -1590,7 +1829,7 @@ def _get_etf_volume_top3() -> str:
     for i, it in enumerate(items, 1):
         rate = it.get("change_rate", 0)
         icon = "🟢" if rate >= 0 else "🔴"
-        lines.append(f"┗ {i}. {icon} {it['name']} | {it['volume']:,}주 | {rate:+.2f}%")
+        lines.append(f"  {i}. {icon} {it['name']}  {it['volume']:,}주 ({rate:+.2f}%)")
     return "\n".join(lines)
 
 def get_account_profit_with_yearly_report():
@@ -1621,6 +1860,8 @@ def run():
     schedule.every().day.at("08:30").do(job_daily_new_etf_check)     # 신규 ETF (2차, 장전시간외)
     schedule.every().day.at("08:10").do(job_weekly_etf_briefing)
     schedule.every().day.at("08:10").do(job_monthly_etf_report)
+    schedule.every().day.at("08:10").do(job_weekly_listing_etf)      # 금주 상장 ETF (주간 첫 거래일)
+    schedule.every().day.at("08:10").do(job_today_listing_etf_reminder)  # 상장 당일 리마인드
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
     schedule.every().day.at("15:50").do(job_snapshot_foreign_flow)
 
