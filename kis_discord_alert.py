@@ -1849,13 +1849,479 @@ def get_account_profit_with_yearly_report():
         pass
     return main_report
 
+def _get_stock_daily_change(code: str) -> Optional[Dict]:
+    """KIS inquire-price API로 종목의 당일 등락 정보 조회"""
+    token = get_kis_access_token()
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-price"
+    headers = {
+        "authorization": f"Bearer {token}", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
+        "tr_id": "FHKST01010100", "Content-Type": "application/json"
+    }
+    params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code}
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=8).json()
+        if res.get("rt_cd") != "0":
+            return None
+        out = res.get("output", {}) or {}
+        return {
+            "name": out.get("hts_kor_isnm") or code,
+            "price": safe_int(out.get("stck_prpr")),              # 현재가
+            "change": safe_int(out.get("prdy_vrss")),             # 전일대비
+            "change_rate": safe_float(out.get("prdy_ctrt")),      # 전일대비율
+            "volume": safe_int(out.get("acml_vol")),              # 누적거래량
+            "trade_amount": safe_int(out.get("acml_tr_pbmn")),    # 누적거래대금
+            "high": safe_int(out.get("stck_hgpr")),               # 고가
+            "low": safe_int(out.get("stck_lwpr")),                # 저가
+            "per": safe_float(out.get("per")),                    # PER
+            "pbr": safe_float(out.get("pbr")),                    # PBR
+            "w52_high": safe_int(out.get("stck_dryy_hgpr")),      # 52주 최고
+            "w52_low": safe_int(out.get("stck_dryy_lwpr")),       # 52주 최저
+        }
+    except Exception as e:
+        print(f"[inquire-price 오류] {code} / {e}")
+        return None
+
+
+def _get_holdings_codes() -> List[Tuple[str, str]]:
+    """현재 보유종목의 (code, name) 리스트 반환"""
+    token = get_kis_access_token()
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/trading/inquire-balance"
+    headers = {
+        "authorization": f"Bearer {token}", "appkey": KIS_APP_KEY, "appsecret": KIS_APP_SECRET,
+        "tr_id": "TTTC8434R", "Content-Type": "application/json"
+    }
+    params = {
+        "CANO": KIS_ACCOUNT_NO[:8], "ACNT_PRDT_CD": KIS_ACCOUNT_NO[9:], "INQR_DVSN": "02", "UNPR_DVSN": "01",
+        "AFHR_FLPR_YN": "N", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "OFL_YN": "N",
+        "PRCS_DVSN": "00", "CTX_AREA_FK100": "P", "CTX_AREA_NK100": ""
+    }
+    res = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="잔고 API")
+    if res.get("rt_cd") != "0":
+        return []
+    result = []
+    for item in res.get("output1", []):
+        qty = safe_int(item.get("hldg_qty"))
+        if qty > 0:
+            result.append((item.get("pdno", ""), item.get("prdt_name", ""), qty,
+                           safe_float(item.get("pchs_avg_pric")), safe_int(item.get("evlu_amt"))))
+    return result
+
+
+def _get_consecutive_flow_top(prefix: str, label: str, topn: int = 5) -> str:
+    """Redis 수급 시계열에서 연속 순매수 종목 TOP N 추출"""
+    if not r:
+        return ""
+    codes = []
+    try:
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor=cursor, match=f"{prefix}:*", count=500)
+            for k in keys:
+                if k.startswith(f"{prefix}:"):
+                    codes.append(k.split(f"{prefix}:", 1)[1])
+            if cursor == 0:
+                break
+    except Exception:
+        return ""
+
+    scored = []
+    for code in codes:
+        series_kv = _get_flow_series(prefix, code, days=10)
+        if len(series_kv) < 3:
+            continue
+        values = [v for _, v in series_kv]
+        # 최근부터 연속 순매수 일수 계산
+        consec = 0
+        for v in reversed(values):
+            if v > 0:
+                consec += 1
+            else:
+                break
+        if consec < 3:
+            continue
+        recent_total = sum(v for v in values[-consec:])
+        name = _lookup_name(code)
+        scored.append((consec, recent_total, code, name, values))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    top = scored[:topn]
+    lines = [f"{label} 연속 순매수 TOP"]
+    for rank, (consec, total, code, name, vals) in enumerate(top, 1):
+        trend_chars = []
+        max_v = max(abs(v) for v in vals) if vals else 1
+        for v in vals:
+            if v <= 0:
+                trend_chars.append("▼")
+            else:
+                level = int(v / max(max_v, 1) * 4)
+                trend_chars.append(["▁", "▂", "▃", "▅", "▇"][min(level, 4)])
+        trend_bar = "".join(trend_chars)
+        lines.append(f"  {rank}. {name} — {consec}일 연속 매수")
+        lines.append(f"     {trend_bar}  합계 {total:+,}주")
+    return "\n".join(lines)
+
+
+def _get_fx_summary() -> str:
+    """주요 환율 요약"""
+    lines = []
+    for ccy, name in [("USD", "달러"), ("JPY", "엔(100)"), ("CNY", "위안")]:
+        rate = get_fx_rate_ccykrw(ccy)
+        if ccy == "JPY":
+            lines.append(f"  💱 {name}: {rate * 100:,.1f}원")
+        else:
+            lines.append(f"  💱 {name}: {rate:,.1f}원")
+    return "\n".join(lines)
+
+
+def _build_stock_picks() -> str:
+    """데이터 기반 다음날 주목 종목 선별
+
+    선별 기준 (모두 팩트 데이터 기반, 추측 없음):
+    1. 외국인+기관 동시 순매수 (당일)
+    2. 외국인 3일+ 연속 순매수 + 당일 주가 상승
+    3. 기관 3일+ 연속 순매수 + 당일 주가 상승
+    4. 거래량 급증 + 외국인 순매수 (돌파 시그널)
+
+    각 종목에 신뢰도 점수(S/A/B)를 부여:
+    S: 3개 이상 조건 충족
+    A: 2개 조건 충족
+    B: 1개 조건 충족 (강한 신호)
+    """
+    if not r:
+        return ""
+
+    # 1단계: 외국인/기관 순매수 당일 데이터 수집 (KOSPI + KOSDAQ)
+    all_rows = []
+    for market in ("0000", "0001"):
+        fetched = _call_foreign_institution_total(fid_input_iscd=market, fid_div_cls="1", fid_rank_sort="0")
+        all_rows.extend(fetched)
+        time.sleep(0.25)
+
+    if not all_rows:
+        return ""
+
+    # code별 당일 수급 정리
+    daily_flow = {}
+    for row in all_rows:
+        code = (row.get("mksc_shrn_iscd") or "").strip()
+        if not code:
+            continue
+        name = row.get("hts_kor_isnm") or row.get("isnm") or code
+        frgn = safe_int(row.get("frgn_ntby_qty"))
+        orgn = safe_int(row.get("orgn_ntby_qty"))
+        frgn_amt = safe_int(row.get("frgn_ntby_tr_pbmn"))  # 외국인 순매수 금액
+        orgn_amt = safe_int(row.get("orgn_ntby_tr_pbmn"))  # 기관 순매수 금액
+        if code not in daily_flow or abs(frgn) > abs(daily_flow[code].get("frgn", 0)):
+            daily_flow[code] = {
+                "name": name, "frgn": frgn, "orgn": orgn,
+                "frgn_amt": frgn_amt, "orgn_amt": orgn_amt,
+            }
+
+    # 2단계: 후보 종목 평가
+    candidates = []
+    checked = 0
+    for code, flow in daily_flow.items():
+        # 기본 필터: 외국인 또는 기관 순매수가 있어야 함
+        if flow["frgn"] <= 0 and flow["orgn"] <= 0:
+            continue
+
+        conditions = []
+        score = 0
+
+        # 조건1: 외국인+기관 동시 순매수
+        if flow["frgn"] > 0 and flow["orgn"] > 0:
+            conditions.append("외국인+기관 동시 순매수")
+            score += 3
+
+        # 조건2: 외국인 연속 순매수 (Redis 시계열)
+        frgn_series = _get_flow_series("FRGN_FLOW", code, days=7)
+        frgn_vals = [v for _, v in frgn_series] if frgn_series else []
+        frgn_consec = 0
+        for v in reversed(frgn_vals):
+            if v > 0:
+                frgn_consec += 1
+            else:
+                break
+        if frgn_consec >= 3:
+            conditions.append(f"외국인 {frgn_consec}일 연속 순매수")
+            score += 2 + min(frgn_consec - 3, 2)  # 3일=2, 4일=3, 5일+=4
+
+        # 조건3: 기관 연속 순매수
+        orgn_series = _get_flow_series("ORGN_FLOW", code, days=7)
+        orgn_vals = [v for _, v in orgn_series] if orgn_series else []
+        orgn_consec = 0
+        for v in reversed(orgn_vals):
+            if v > 0:
+                orgn_consec += 1
+            else:
+                break
+        if orgn_consec >= 3:
+            conditions.append(f"기관 {orgn_consec}일 연속 순매수")
+            score += 2 + min(orgn_consec - 3, 2)
+
+        if not conditions:
+            continue
+
+        # 조건4: 당일 시세 정보 (상위 후보만 조회 — API 호출 절약)
+        if score >= 2 and checked < 30:
+            checked += 1
+            daily = _get_stock_daily_change(code)
+            time.sleep(0.12)
+            if daily:
+                chg_rate = daily["change_rate"]
+                if chg_rate > 0:
+                    conditions.append(f"당일 +{chg_rate:.2f}% 상승")
+                    score += 1
+
+                # 52주 저가 구간이면 추가 점수
+                if daily["w52_high"] and daily["w52_low"] and daily["w52_high"] > daily["w52_low"]:
+                    pos = (daily["price"] - daily["w52_low"]) / (daily["w52_high"] - daily["w52_low"]) * 100
+                    if pos <= 30:
+                        conditions.append(f"52주 저가 구간 ({pos:.0f}%)")
+                        score += 1
+                    elif pos >= 85:
+                        conditions.append(f"52주 고가 구간 ({pos:.0f}%)")
+                        # 고가 구간은 점수 감점
+                        score -= 1
+
+                candidates.append({
+                    "code": code, "name": flow["name"], "score": score,
+                    "conditions": conditions, "frgn": flow["frgn"], "orgn": flow["orgn"],
+                    "price": daily["price"], "change_rate": chg_rate,
+                    "frgn_consec": frgn_consec, "orgn_consec": orgn_consec,
+                })
+            else:
+                candidates.append({
+                    "code": code, "name": flow["name"], "score": score,
+                    "conditions": conditions, "frgn": flow["frgn"], "orgn": flow["orgn"],
+                    "price": 0, "change_rate": 0,
+                    "frgn_consec": frgn_consec, "orgn_consec": orgn_consec,
+                })
+        elif score >= 3:
+            candidates.append({
+                "code": code, "name": flow["name"], "score": score,
+                "conditions": conditions, "frgn": flow["frgn"], "orgn": flow["orgn"],
+                "price": 0, "change_rate": 0,
+                "frgn_consec": frgn_consec, "orgn_consec": orgn_consec,
+            })
+
+    if not candidates:
+        return ""
+
+    # 3단계: 점수순 정렬 후 상위 7개
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    top = candidates[:7]
+
+    lines = [f"{'━'*28}", "🎯 [내일 주목 종목 — 데이터 기반 선별]"]
+    lines.append("  (외국인/기관 수급 + 연속매수 + 시세 분석)")
+
+    for rank, c in enumerate(top, 1):
+        # 신뢰도 등급
+        if c["score"] >= 6:
+            grade = "🔴S"
+        elif c["score"] >= 4:
+            grade = "🟠A"
+        else:
+            grade = "🟡B"
+
+        lines.append(f"\n  {rank}. {grade} {c['name']} ({c['code']})")
+        if c["price"]:
+            lines.append(f"     종가 {c['price']:,}원 ({c['change_rate']:+.2f}%)")
+
+        # 수급 요약
+        flow_parts = []
+        if c["frgn"] != 0:
+            flow_parts.append(f"외국인 {c['frgn']:+,}주")
+        if c["orgn"] != 0:
+            flow_parts.append(f"기관 {c['orgn']:+,}주")
+        if flow_parts:
+            lines.append(f"     수급: {' / '.join(flow_parts)}")
+
+        # 연속 매수 트렌드 바
+        if c["frgn_consec"] >= 3:
+            frgn_s = _get_flow_series("FRGN_FLOW", c["code"], days=7)
+            if frgn_s:
+                vals = [v for _, v in frgn_s]
+                mx = max(abs(v) for v in vals) if vals else 1
+                bar = "".join("▼" if v <= 0 else ["▁", "▂", "▃", "▅", "▇"][min(int(v / max(mx, 1) * 4), 4)] for v in vals)
+                lines.append(f"     외국인 {c['frgn_consec']}일 연속: {bar}")
+
+        # 선별 근거
+        lines.append(f"     근거: {' | '.join(c['conditions'])}")
+
+    lines.append(f"\n  ⚠️ 수급/시세 데이터 기반 분석이며 투자 권유가 아닙니다")
+    return "\n".join(lines)
+
+
+def build_closing_analysis() -> str:
+    """장마감 종합 분석 — 다음날 투자 판단에 필요한 정제 데이터"""
+    now_ts = datetime.now(KST).strftime("%m/%d %H:%M")
+    sections = []
+
+    # ── 헤더 ──
+    sections.append(f"{'━'*28}\n🌙 [장마감 종합 분석] {now_ts}")
+
+    # ── 1. 시장 지수 종가 ──
+    try:
+        indices = _fetch_market_indices()
+        if indices:
+            sections.append(f"\n📈 [시장 종가]\n{indices}")
+    except Exception:
+        pass
+
+    # ── 2. 보유종목 당일 성적표 + 수급 ──
+    try:
+        holdings = _get_holdings_codes()
+        if holdings:
+            h_lines = [f"\n{'━'*28}", "📋 [보유종목 당일 분석]"]
+            token = get_kis_access_token()
+            signals = []  # (name, signal_type) — 투자 시그널 수집용
+
+            for code, name, qty, avg_price, eval_amt in holdings:
+                daily = _get_stock_daily_change(code)
+                if not daily:
+                    continue
+                time.sleep(0.15)
+
+                chg = daily["change"]
+                chg_rate = daily["change_rate"]
+                icon = "🟢" if chg >= 0 else "🔴"
+
+                h_lines.append(f"\n{icon} {name} ({qty}주)")
+                h_lines.append(f"  종가 {daily['price']:,}원 ({chg:+,}원, {chg_rate:+.2f}%)")
+
+                # 당일 변동 폭 (고가-저가)
+                if daily["high"] and daily["low"]:
+                    swing = daily["high"] - daily["low"]
+                    swing_pct = (swing / daily["low"] * 100) if daily["low"] else 0
+                    h_lines.append(f"  변동폭 {swing:,}원 ({swing_pct:.1f}%) | 고 {daily['high']:,} / 저 {daily['low']:,}")
+
+                # 52주 고저 대비 위치
+                if daily["w52_high"] and daily["w52_low"] and daily["w52_high"] > daily["w52_low"]:
+                    pos = (daily["price"] - daily["w52_low"]) / (daily["w52_high"] - daily["w52_low"]) * 100
+                    pos_bar = "▓" * int(pos / 10) + "░" * (10 - int(pos / 10))
+                    h_lines.append(f"  52주 위치 [{pos_bar}] {pos:.0f}%")
+
+                    if pos >= 90:
+                        signals.append((name, "52주 신고가 근접"))
+                    elif pos <= 15:
+                        signals.append((name, "52주 저가 구간"))
+
+                # 외국인/기관 당일 수급
+                flow = get_market_summary(token, code)
+                if flow and "오류" not in flow and "없음" not in flow:
+                    h_lines.append(f"  {flow}")
+
+                    # 외국인 대량매수 시그널 파싱
+                    if "외국인: 🟢" in flow:
+                        signals.append((name, "외국인 순매수"))
+                    if "기관: 🟢" in flow:
+                        signals.append((name, "기관 순매수"))
+
+                # Redis 수급 추세 (최근 5일)
+                frgn_series = _get_flow_series("FRGN_FLOW", code, days=5)
+                if frgn_series:
+                    frgn_vals = [v for _, v in frgn_series]
+                    consec_buy = 0
+                    for v in reversed(frgn_vals):
+                        if v > 0:
+                            consec_buy += 1
+                        else:
+                            break
+                    if consec_buy >= 3:
+                        h_lines.append(f"  ⚡ 외국인 {consec_buy}일 연속 순매수")
+                        signals.append((name, f"외국인 {consec_buy}일 연속 순매수"))
+
+            sections.append("\n".join(h_lines))
+
+    except Exception as e:
+        sections.append(f"\n📋 보유종목 분석 오류: {e}")
+        signals = []
+
+    # ── 3. 기존 종합 리포트 (자산/실현손익/수익률) ──
+    try:
+        main_report = get_account_profit(False)
+        # 보유종목 목록은 위에서 이미 표시했으므로, 자산 현황 부분만 추출
+        asset_marker = "💼 [총 자산]"
+        idx = main_report.find(asset_marker)
+        if idx >= 0:
+            # 자산현황 이후 부분만 사용
+            asset_section = main_report[main_report.rfind("━" * 28, 0, idx):] if main_report.rfind("━" * 28, 0, idx) >= 0 else main_report[idx:]
+            sections.append(f"\n{asset_section}")
+        else:
+            sections.append(f"\n{main_report}")
+    except Exception as e:
+        sections.append(f"\n💼 자산 현황 조회 오류: {e}")
+
+    # ── 4. 당일 수급 TOP (외국인/기관 순매수 TOP 5) ──
+    try:
+        supply = build_daily_top_supply_demand(topn=5)
+        if supply:
+            sections.append(f"\n{supply}")
+    except Exception as e:
+        sections.append(f"\n📊 수급 TOP 조회 오류: {e}")
+
+    # ── 5. 외국인/기관 연속 순매수 종목 ──
+    try:
+        frgn_consec = _get_consecutive_flow_top("FRGN_FLOW", "🌍 외국인", topn=5)
+        orgn_consec = _get_consecutive_flow_top("ORGN_FLOW", "🏛️ 기관", topn=5)
+        consec_parts = [p for p in [frgn_consec, orgn_consec] if p]
+        if consec_parts:
+            sections.append(f"\n{'━'*28}\n🔥 [스마트머니 연속 매수 추적]\n" + "\n\n".join(consec_parts))
+    except Exception:
+        pass
+
+    # ── 6. ETF 거래량 TOP 3 ──
+    try:
+        etf_vol = _get_etf_volume_top3()
+        if etf_vol:
+            sections.append(f"\n{etf_vol}")
+    except Exception:
+        pass
+
+    # ── 7. 환율 ──
+    try:
+        fx = _get_fx_summary()
+        if fx:
+            sections.append(f"\n{'━'*28}\n💱 [주요 환율]\n{fx}")
+    except Exception:
+        pass
+
+    # ── 8. 내 보유종목 시그널 요약 ──
+    try:
+        if signals:
+            sig_lines = [f"\n{'━'*28}", "⚡ [보유종목 시그널]"]
+            seen = set()
+            for name, sig_type in signals:
+                key = f"{name}:{sig_type}"
+                if key not in seen:
+                    seen.add(key)
+                    sig_lines.append(f"  • {name} — {sig_type}")
+            sections.append("\n".join(sig_lines))
+    except Exception:
+        pass
+
+    # ── 9. 내일 주목 종목 선별 (핵심) ──
+    try:
+        picks = _build_stock_picks()
+        if picks:
+            sections.append(f"\n{picks}")
+    except Exception as e:
+        sections.append(f"\n🎯 종목 선별 오류: {e}")
+
+    return "\n".join(sections)
+
+
 def run():
     print(f"[시작] KIS Discord Alert Bot (연도: {current_year()})")
     send_alert_message(f"✅ 알림 봇 시작 ({current_year()})")
 
     # 스케줄 등록
     schedule.every().day.at("08:30").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
-    schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(get_account_profit_with_yearly_report()))
+    schedule.every().day.at("16:00").do(lambda: is_trading_day() and send_alert_message(build_closing_analysis()))
     schedule.every().day.at("08:10").do(job_daily_new_etf_check)     # 신규 ETF (1차)
     schedule.every().day.at("08:30").do(job_daily_new_etf_check)     # 신규 ETF (2차, 장전시간외)
     schedule.every().day.at("08:10").do(job_weekly_etf_briefing)
