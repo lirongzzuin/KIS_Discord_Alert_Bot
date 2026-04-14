@@ -715,7 +715,7 @@ def get_account_profit(only_changes=True):
     params = {
         "CANO": KIS_ACCOUNT_NO[:8], "ACNT_PRDT_CD": KIS_ACCOUNT_NO[9:], "INQR_DVSN": "02", "UNPR_DVSN": "01",
         "AFHR_FLPR_YN": "N", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "OFL_YN": "N",
-        "PRCS_DVSN": "00", "CTX_AREA_FK100": "P", "CTX_AREA_NK100": ""
+        "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
     }
     res = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="잔고 API")
     if res.get("rt_cd") != "0":
@@ -768,12 +768,15 @@ def get_account_profit(only_changes=True):
     if isinstance(acct_summary, list) and acct_summary:
         acct_summary = acct_summary[0]
     cash = safe_int(acct_summary.get("dnca_tot_amt", "0"))
-    kr_total_assets = safe_int(acct_summary.get("tot_evlu_amt", "0"))  # 총평가(보유+예수금)
     kr_buy_total = safe_int(acct_summary.get("pchs_amt_smtl_amt", "0"))  # 매입금액 합계
     kr_eval_total = safe_int(acct_summary.get("evlu_amt_smtl_amt", "0"))  # 평가금액 합계
     kr_pl_total = safe_int(acct_summary.get("evlu_pfls_smtl_amt", "0"))  # 평가손익 합계
     prev_total = safe_int(acct_summary.get("bfdy_tot_asst_evlu_amt", "0"))  # 전일 총자산
     day_change = safe_int(acct_summary.get("asst_icdc_amt", "0"))  # 오늘 자산 증감
+
+    # 국내 총자산 = 보유평가 + 예수금 (KIS tot_evlu_amt가 상황에 따라 예수금 제외 값을
+    # 반환하는 경우가 있어 합산식으로 직접 계산 — baseline 오염 방지)
+    kr_total_assets = kr_eval_total + cash
 
     # 해외 평가
     ovrs_eval, ovrs_invest = _get_total_overseas_eval()
@@ -1937,7 +1940,7 @@ def _get_holdings_codes() -> List[Tuple[str, str]]:
     params = {
         "CANO": KIS_ACCOUNT_NO[:8], "ACNT_PRDT_CD": KIS_ACCOUNT_NO[9:], "INQR_DVSN": "02", "UNPR_DVSN": "01",
         "AFHR_FLPR_YN": "N", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N", "OFL_YN": "N",
-        "PRCS_DVSN": "00", "CTX_AREA_FK100": "P", "CTX_AREA_NK100": ""
+        "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""
     }
     res = _kis_api_request("GET", url, headers, params, timeout=15, max_retries=3, label="잔고 API")
     if res.get("rt_cd") != "0":
