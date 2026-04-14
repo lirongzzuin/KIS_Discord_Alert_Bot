@@ -2153,6 +2153,13 @@ def build_morning_discovery() -> str:
         time.sleep(0.25)
 
     if not all_rows:
+        # KIS foreign-institution-total API는 장중(09:00~15:40)에는 당일 집계 전이라 0건 반환.
+        # 08:30 정규 브리핑 시점에는 전일 집계가 완료돼 정상 동작.
+        now_hm = datetime.now(KST).strftime("%H%M")
+        if "0900" <= now_hm <= "1540":
+            return (f"{'━'*28}\n🎯 [신규 종목 발굴]"
+                    f"\n  ⓘ 장중 호출 — KIS 수급 집계 API는 장마감 후에만 데이터 제공"
+                    f"\n  ⓘ 정규 08:30 브리핑에서 전일 집계 기반으로 자동 발굴됩니다")
         return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 수급 데이터 조회 실패 — 발굴 불가"
 
     daily_flow = {}
