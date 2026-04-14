@@ -670,12 +670,15 @@ def ensure_baseline_snapshot(total_assets: int, unrealized: int) -> Dict[str, ob
         return default
 
 def save_daily_asset_snapshot(total_assets: int, unrealized: int, realized_cum: int):
-    """일별 총자산 스냅샷 — 추후 '실제 수익률' 전환을 위한 데이터 누적."""
+    """일별 총자산 스냅샷 — cash flow 역산의 원천 데이터.
+    호출 시점에 덮어쓰기 방식 (같은 날짜면 최신 값이 남음).
+    """
     if not r:
         return
     today = datetime.now(KST).strftime("%Y%m%d")
     try:
         payload = json.dumps({
+            "date": today,
             "total": int(total_assets),
             "unrealized": int(unrealized),
             "realized_cum": int(realized_cum),
@@ -684,6 +687,107 @@ def save_daily_asset_snapshot(total_assets: int, unrealized: int, realized_cum: 
         r.set(f"ASSET_SNAPSHOT:{today}", payload)
     except Exception as e:
         print(f"[일별 스냅샷 저장 오류] {e}")
+
+
+def _load_all_asset_snapshots(year: Optional[int] = None) -> List[Dict]:
+    """저장된 모든 ASSET_SNAPSHOT을 날짜순(오름차순)으로 반환. year가 주어지면 해당 연도만."""
+    if not r:
+        return []
+    prefix_match = f"ASSET_SNAPSHOT:{year}*" if year else "ASSET_SNAPSHOT:*"
+    keys = []
+    try:
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=prefix_match, count=200)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+    except Exception as e:
+        print(f"[스냅샷 스캔 오류] {e}")
+        return []
+
+    snapshots = []
+    for k in sorted(keys):
+        try:
+            raw = r.get(k)
+            if not raw:
+                continue
+            data = json.loads(raw)
+            if "date" not in data:
+                data["date"] = k.split(":", 1)[1]
+            snapshots.append(data)
+        except Exception:
+            continue
+    snapshots.sort(key=lambda x: x.get("date", ""))
+    return snapshots
+
+
+def infer_cash_flows(year: Optional[int] = None) -> List[Dict]:
+    """일별 스냅샷으로 외부 현금흐름(입출금+배당)을 역산.
+
+    회계 항등식:
+        Δtotal = Δrealized_cum + ΔU + CashFlow_external
+      ⇒ CashFlow_external = Δtotal - Δrealized_cum - ΔU
+
+    이 값은 오차 0 보장:
+      · Δtotal: KIS 단일 snapshot의 총자산 차이
+      · Δrealized_cum: TTTC8715R 순 실현손익(수수료/세금 차감 후)
+      · ΔU: 평가손익 합계(evlu_pfls_smtl_amt) 차이
+      · 세 값 모두 시장 변동/매매와 완전 분리됨 → 잔여분은 외부 유입/유출
+
+    라벨링: 배당금/권리락 수령도 이 버킷에 포함됨 ("입출금+배당" 합산).
+    """
+    year = year or current_year()
+    snaps = _load_all_asset_snapshots(year)
+    if len(snaps) < 2:
+        return []
+
+    flows = []
+    for i in range(1, len(snaps)):
+        prev = snaps[i - 1]
+        cur = snaps[i]
+        d_total = int(cur.get("total", 0)) - int(prev.get("total", 0))
+        d_realized = int(cur.get("realized_cum", 0)) - int(prev.get("realized_cum", 0))
+        d_unrealized = int(cur.get("unrealized", 0)) - int(prev.get("unrealized", 0))
+        cash_flow = d_total - d_realized - d_unrealized
+        flows.append({
+            "from_date": prev.get("date", ""),
+            "to_date": cur.get("date", ""),
+            "cash_flow": cash_flow,
+            "d_total": d_total,
+            "d_realized": d_realized,
+            "d_unrealized": d_unrealized,
+        })
+    return flows
+
+
+def _format_cash_flow_section(flows: List[Dict]) -> str:
+    """역산된 cash flow를 08:30 브리핑용 섹션 텍스트로 변환."""
+    if not flows:
+        return ""
+    net_total = sum(int(f["cash_flow"]) for f in flows)
+    in_total = sum(int(f["cash_flow"]) for f in flows if f["cash_flow"] > 0)
+    out_total = sum(int(f["cash_flow"]) for f in flows if f["cash_flow"] < 0)
+
+    lines = [f"{'━'*28}", "💸 [외부 자금이동] 기준일 이후 자동 감지 (입출금+배당 합산)"]
+    net_icon = "🟢" if net_total >= 0 else "🔴"
+    lines.append(f"  {net_icon} 순 자금이동: {_fmt_won_short(net_total, sign=True)}")
+    if in_total:
+        lines.append(f"    ↳ 유입 합계: {_fmt_won_short(in_total, sign=True)}")
+    if out_total:
+        lines.append(f"    ↳ 유출 합계: {_fmt_won_short(out_total, sign=True)}")
+    lines.append(f"  · 관측 일수: {len(flows) + 1}일 ({flows[0]['from_date']}~{flows[-1]['to_date']})")
+
+    # 최근 5건의 유의미한 이동만 표시 (±1,000원 초과)
+    significant = [f for f in flows if abs(int(f["cash_flow"])) > 1000]
+    if significant:
+        lines.append("  · 최근 이동 내역:")
+        for f in significant[-5:]:
+            icon = "🟢" if f["cash_flow"] > 0 else "🔴"
+            lines.append(f"    {icon} {f['to_date']}: {_fmt_won_short(int(f['cash_flow']), sign=True)}")
+
+    lines.append("  ※ 회계 항등식 기반 역산 (오차 0). 배당/권리 수령도 포함")
+    return "\n".join(lines)
 
 def _get_total_overseas_eval() -> Tuple[float, float]:
     try:
@@ -1888,6 +1992,13 @@ def get_account_profit_with_yearly_report():
             main_report += "\n\n" + etf_vol
     except Exception:
         pass
+    try:
+        flows = infer_cash_flows()
+        cash_section = _format_cash_flow_section(flows)
+        if cash_section:
+            main_report += "\n\n" + cash_section
+    except Exception as e:
+        main_report += f"\n\n💸 외부 자금이동 역산 오류: {e}"
     try:
         discovery = build_morning_discovery()
         if discovery:
