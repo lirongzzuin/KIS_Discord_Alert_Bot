@@ -315,6 +315,66 @@ def _fetch_fx_from_frankfurter(ccy: str) -> Optional[float]:
     return None
 
 
+def _fetch_fx_historical_krw(ccy: str, days_back: int) -> Optional[float]:
+    """Frankfurter 과거 환율 — 주말/공휴일은 직전 거래일로 자동 폴백."""
+    try:
+        for offset in range(days_back, days_back + 5):
+            d = (datetime.now(KST).date() - timedelta(days=offset)).strftime("%Y-%m-%d")
+            url = f"https://api.frankfurter.app/{d}?from={ccy}&to=KRW"
+            res = requests.get(url, timeout=8, headers={"User-Agent": "kis-alert-bot"})
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            rate = (data.get("rates") or {}).get("KRW")
+            if rate:
+                v = float(rate)
+                if v > 0:
+                    return v
+    except Exception as e:
+        print(f"[FX 과거 조회 오류] {ccy}/{days_back}d / {e}")
+    return None
+
+
+def _get_fx_macro_context() -> str:
+    """USD/KRW 현재값 + 5일 변화 + 수출주 우호/불리 태그 한 줄.
+    발굴 브리핑 상단에 매크로 톤을 잡기 위한 컨텍스트 라인.
+    6시간 Redis 캐시로 장 시작 전·장마감 두 번 호출돼도 외부 API 부담 없음.
+    """
+    cache_key = "FX_MACRO_CTX"
+    if r:
+        try:
+            cached = r.get(cache_key)
+            if cached:
+                return cached
+        except Exception:
+            pass
+    try:
+        cur = _fetch_fx_from_frankfurter("USD") or _fetch_fx_from_er_api("USD")
+        if not cur:
+            return ""
+        past5 = _fetch_fx_historical_krw("USD", days_back=5)
+        if not past5:
+            ctx = f"  🌐 USD/KRW {cur:,.1f}원 (5일 변화: n/a)"
+        else:
+            delta_pct = (cur - past5) / past5 * 100
+            if delta_pct > 0.7:
+                bias = "원화 약세 → 수출주(반도체·자동차·조선) 우호적"
+            elif delta_pct < -0.7:
+                bias = "원화 강세 → 내수·여행·수입주 우호적"
+            else:
+                bias = "환율 횡보 (방향성 약함)"
+            ctx = f"  🌐 USD/KRW {cur:,.1f}원 (5일 {delta_pct:+.2f}%) · {bias}"
+        if r:
+            try:
+                r.setex(cache_key, 6 * 3600, ctx)
+            except Exception:
+                pass
+        return ctx
+    except Exception as e:
+        print(f"[FX 매크로 컨텍스트 오류] {e}")
+        return ""
+
+
 def _fetch_fx_from_er_api(ccy: str) -> Optional[float]:
     """open.er-api.com — frankfurter 실패 시 백업 소스."""
     try:
@@ -2480,6 +2540,11 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
         # 가중치 편차를 점수에 가산 (1.2 → +0.6, 0.5 → -1.5)
         cand["score"] = round(cand["score"] + (avg_w - 1.0) * 3, 2)
 
+    # 가중치 적용 후에도 품질 게이트 재검증 (0.5배 페널티로 6점 미만 떨어진 후보 제거)
+    candidates = [c for c in candidates if c["score"] >= 6 and len(c.get("conds", [])) >= 3]
+    if not candidates:
+        return [], "no_candidates"
+
     candidates.sort(key=lambda x: x["score"], reverse=True)
     return candidates[:max_candidates], ""
 
@@ -2491,6 +2556,11 @@ def _format_discovery_briefing(top: List[Dict], source: str = "live",
     lines.append("  (수급·추세·기술·유동성 복합 지표 기반, 점수 ≥ 6)")
     if source == "cached" and snapshot_date:
         lines.append(f"  ⓘ 전일({snapshot_date}) 장마감 집계 기반 사전계산 데이터")
+
+    # 환율 매크로 컨텍스트 (수출주 방향성 참고용)
+    fx_ctx = _get_fx_macro_context()
+    if fx_ctx:
+        lines.append(fx_ctx)
 
     reliability_line = _format_reliability_summary()
     if reliability_line:
