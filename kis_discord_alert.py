@@ -298,36 +298,59 @@ def _fx_load(ccy: str) -> Optional[float]:
     except:
         return None
 
+def _fetch_fx_from_frankfurter(ccy: str) -> Optional[float]:
+    """Frankfurter API (ECB 기반, 무료·키 불필요). 장중 최신 고시환율."""
+    try:
+        url = f"https://api.frankfurter.app/latest?from={ccy}&to=KRW"
+        res = requests.get(url, timeout=8, headers={"User-Agent": "kis-alert-bot"})
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        rate = (data.get("rates") or {}).get("KRW")
+        if rate:
+            v = float(rate)
+            return v if v > 0 else None
+    except Exception as e:
+        print(f"[FX frankfurter 오류] {ccy} / {e}")
+    return None
+
+
+def _fetch_fx_from_er_api(ccy: str) -> Optional[float]:
+    """open.er-api.com — frankfurter 실패 시 백업 소스."""
+    try:
+        url = f"https://open.er-api.com/v6/latest/{ccy}"
+        res = requests.get(url, timeout=8, headers={"User-Agent": "kis-alert-bot"})
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        if data.get("result") != "success":
+            return None
+        rate = (data.get("rates") or {}).get("KRW")
+        if rate:
+            v = float(rate)
+            return v if v > 0 else None
+    except Exception as e:
+        print(f"[FX er-api 오류] {ccy} / {e}")
+    return None
+
+
 def get_fx_rate_ccykrw(ccy: str) -> float:
+    """통화→원화 환율 조회. 캐시(15분) → Frankfurter → open.er-api → 하드코딩 fallback 순."""
     ccy = ccy.upper().strip()
     if ccy == "KRW":
         return 1.0
     v = _fx_load(ccy)
-    if v: return v
-    try:
-        token = get_kis_access_token()
-        url = "https://openapi.koreainvestment.com:9443/uapi/overseas-stock/v1/quotations/inquire-ccy-price"
-        headers = {
-            "authorization": f"Bearer {token}",
-            "appkey": KIS_APP_KEY,
-            "appsecret": KIS_APP_SECRET,
-            "tr_id": "HHDFS00000300",
-            "custtype": "P",
-            "Content-Type": "application/json"
-        }
-        params = {"CCY": ccy}
-        res = requests.get(url, headers=headers, params=params, timeout=8)
-        if res.status_code == 200:
-            data = res.json()
-            out = data.get("output") or {}
-            rate = out.get("rate") or out.get("aply_xchg_rt") or out.get("fx_rate")
-            if rate:
-                fx = float(str(rate).replace(",", ""))
-                if fx > 0:
-                    _fx_save(ccy, fx)
-                    return fx
-    except Exception:
-        pass
+    if v:
+        return v
+
+    fx = _fetch_fx_from_frankfurter(ccy)
+    if fx is None:
+        fx = _fetch_fx_from_er_api(ccy)
+
+    if fx and fx > 0:
+        _fx_save(ccy, fx)
+        return fx
+
     if ccy in FX_FALLBACKS and FX_FALLBACKS[ccy] > 0:
         _fx_save(ccy, FX_FALLBACKS[ccy])
         return FX_FALLBACKS[ccy]
