@@ -2000,6 +2000,12 @@ def get_account_profit_with_yearly_report():
     except Exception as e:
         main_report += f"\n\n💸 외부 자금이동 역산 오류: {e}"
     try:
+        manual_section = get_manual_cashflow_summary()
+        if manual_section:
+            main_report += "\n\n" + manual_section
+    except Exception as e:
+        main_report += f"\n\n✍️ 수동 입출금 조회 오류: {e}"
+    try:
         discovery = build_morning_discovery()
         if discovery:
             main_report += "\n\n" + discovery
@@ -2236,8 +2242,8 @@ def _is_excluded_name(name: str) -> bool:
     return False
 
 
-def build_morning_discovery() -> str:
-    """장 시작 전 신규 종목 발굴 — 고품질 선별 브리핑.
+def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], str]:
+    """KIS 라이브 데이터로 발굴 후보를 계산.
 
     지표 (모두 팩트 데이터 기반):
       · 외국인/기관 당일+연속 순매수 (Redis 시계열)
@@ -2248,13 +2254,16 @@ def build_morning_discovery() -> str:
       · 유동성: 당일 거래대금 100억원 이상
       · 저가주 제외 (<1,000원), ETF/ETN/스팩/우선주 제외
 
-    품질 게이트:
-      · 최소 6점 이상 + 3개 이상 지표 충족
-      · 조건 미달 시 "오늘은 조건 충족 종목 없음" 한 줄만 반환
-      · 최대 5종목
+    품질 게이트: 최소 6점 이상 + 3개 이상 지표 충족, 최대 max_candidates 종목.
+
+    Returns: (candidates_list, status_code). status_code:
+      · "" → 정상 (candidates_list 사용)
+      · "no_supply" → 수급 API 빈 응답 (장중 호출 등)
+      · "no_candidates" → 조건 충족 종목 없음
+      · "redis_unavailable" → Redis 미설정
     """
     if not r:
-        return ""
+        return [], "redis_unavailable"
 
     # 1단계: KOSPI + KOSDAQ 수급 데이터 수집
     all_rows = []
@@ -2267,14 +2276,7 @@ def build_morning_discovery() -> str:
         time.sleep(0.25)
 
     if not all_rows:
-        # KIS foreign-institution-total API는 장중(09:00~15:40)에는 당일 집계 전이라 0건 반환.
-        # 08:30 정규 브리핑 시점에는 전일 집계가 완료돼 정상 동작.
-        now_hm = datetime.now(KST).strftime("%H%M")
-        if "0900" <= now_hm <= "1540":
-            return (f"{'━'*28}\n🎯 [신규 종목 발굴]"
-                    f"\n  ⓘ 장중 호출 — KIS 수급 집계 API는 장마감 후에만 데이터 제공"
-                    f"\n  ⓘ 정규 08:30 브리핑에서 전일 집계 기반으로 자동 발굴됩니다")
-        return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 수급 데이터 조회 실패 — 발굴 불가"
+        return [], "no_supply"
 
     daily_flow = {}
     for row in all_rows:
@@ -2441,13 +2443,35 @@ def build_morning_discovery() -> str:
         })
 
     if not candidates:
-        return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 오늘은 품질 기준(점수≥6, 지표≥3)을 충족하는 종목이 없습니다"
+        return [], "no_candidates"
+
+    # 신뢰도 가중치 적용 (지표별 과거 성과 기반 자동 보정)
+    for cand in candidates:
+        conds = cand.get("conds", [])
+        pos_conds = [c for c in conds if not c.startswith("⚠")]
+        if not pos_conds:
+            continue
+        weights = [get_indicator_reliability(c) for c in pos_conds]
+        avg_w = sum(weights) / len(weights)
+        cand["reliability_w"] = round(avg_w, 2)
+        # 가중치 편차를 점수에 가산 (1.2 → +0.6, 0.5 → -1.5)
+        cand["score"] = round(cand["score"] + (avg_w - 1.0) * 3, 2)
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
-    top = candidates[:5]
+    return candidates[:max_candidates], ""
 
+
+def _format_discovery_briefing(top: List[Dict], source: str = "live",
+                               snapshot_date: Optional[str] = None) -> str:
+    """후보 리스트를 브리핑 텍스트로 렌더링. source: 'live' / 'cached'."""
     lines = [f"{'━'*28}", "🎯 [신규 종목 발굴 — 장 시작 전 브리핑]"]
     lines.append("  (수급·추세·기술·유동성 복합 지표 기반, 점수 ≥ 6)")
+    if source == "cached" and snapshot_date:
+        lines.append(f"  ⓘ 전일({snapshot_date}) 장마감 집계 기반 사전계산 데이터")
+
+    reliability_line = _format_reliability_summary()
+    if reliability_line:
+        lines.append(reliability_line)
 
     for rank, c in enumerate(top, 1):
         if c["score"] >= 9:
@@ -2495,10 +2519,701 @@ def build_morning_discovery() -> str:
     return "\n".join(lines)
 
 
+# ================== 발굴 캐시 + 검증 + 자기보정 ==================
+DISCOVERY_SNAPSHOT_KEY = "DISCOVERY_SNAPSHOT"      # DISCOVERY_SNAPSHOT:{YYYYMMDD} → JSON
+DISCOVERY_RECO_KEY = "DISCOVERY_RECO"              # DISCOVERY_RECO:{YYYYMMDD}:{code} → JSON
+DISCOVERY_STATS_KEY = "DISCOVERY_INDICATOR_STATS"  # hash: cond_label → JSON
+DISCOVERY_RECO_TTL = 45 * 24 * 3600                # 45일 보관
+DISCOVERY_SNAPSHOT_TTL = 10 * 24 * 3600            # 10일 보관
+
+
+def _load_latest_discovery_snapshot(max_age_days: int = 3) -> Optional[Dict]:
+    """가장 최근(≤ max_age_days) 장마감 사전계산 스냅샷 로드."""
+    if not r:
+        return None
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_SNAPSHOT_KEY}:*", count=200)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if not keys:
+            return None
+        keys.sort(reverse=True)
+        today = datetime.now(KST).date()
+        for k in keys:
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                data = json.loads(raw)
+                snap_date_str = data.get("date") or k.rsplit(":", 1)[1]
+                try:
+                    snap_date = datetime.strptime(snap_date_str, "%Y%m%d").date()
+                except Exception:
+                    continue
+                if (today - snap_date).days > max_age_days:
+                    continue
+                return data
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[발굴 스냅샷 로드 오류] {e}")
+    return None
+
+
+def _save_recommendations(date_str: str, candidates: List[Dict]):
+    """추천 후보를 검증 추적용 레코드로 저장(중복 시 스킵)."""
+    if not r or not candidates:
+        return
+    now_iso = datetime.now(KST).isoformat()
+    for c in candidates[:5]:
+        code = c.get("code", "")
+        if not code:
+            continue
+        key = f"{DISCOVERY_RECO_KEY}:{date_str}:{code}"
+        try:
+            if r.exists(key):
+                continue
+            reco = {
+                "date": date_str,
+                "code": code,
+                "name": c.get("name", ""),
+                "score": int(c.get("score", 0)),
+                "conds": list(c.get("conds", [])),
+                "entry_price": int(c.get("close", 0)),
+                "entry_ts": now_iso,
+                "verifications": {},   # {"d1": {price, return_pct, check_date}, ...}
+                "verified_final": False,
+            }
+            r.set(key, json.dumps(reco), ex=DISCOVERY_RECO_TTL)
+        except Exception as e:
+            print(f"[추천 저장 오류] {code} / {e}")
+
+
+def precompute_discovery_snapshot():
+    """장마감 시 실행 — 발굴 후보를 Redis에 사전계산·저장."""
+    if not is_trading_day() or not r:
+        return
+    candidates, status = _compute_discovery_candidates(max_candidates=5)
+    if status:
+        print(f"[발굴 사전계산] 스킵: {status}")
+        return
+    if not candidates:
+        return
+    today = datetime.now(KST).strftime("%Y%m%d")
+    try:
+        # 순환 참조/불가변환 필드 제거 (frgn_vals는 그대로 list, 나머지 primitives)
+        clean_cands = []
+        for c in candidates:
+            clean_cands.append({
+                "code": c.get("code"),
+                "name": c.get("name"),
+                "score": int(c.get("score", 0)),
+                "conds": list(c.get("conds", [])),
+                "close": int(c.get("close", 0)),
+                "chg_rate": float(c.get("chg_rate", 0.0)),
+                "trade_amount": int(c.get("trade_amount", 0)),
+                "frgn": int(c.get("frgn", 0)),
+                "orgn": int(c.get("orgn", 0)),
+                "frgn_amt": int(c.get("frgn_amt", 0)),
+                "orgn_amt": int(c.get("orgn_amt", 0)),
+                "frgn_consec": int(c.get("frgn_consec", 0)),
+                "orgn_consec": int(c.get("orgn_consec", 0)),
+                "frgn_vals": [int(v) for v in c.get("frgn_vals", [])],
+                "w52_pos": c.get("w52_pos"),
+            })
+        payload = json.dumps({
+            "date": today,
+            "ts": datetime.now(KST).isoformat(),
+            "candidates": clean_cands,
+        })
+        r.set(f"{DISCOVERY_SNAPSHOT_KEY}:{today}", payload, ex=DISCOVERY_SNAPSHOT_TTL)
+        _save_recommendations(today, clean_cands)
+        print(f"[발굴 사전계산] {len(clean_cands)}종목 저장 완료 ({today})")
+    except Exception as e:
+        print(f"[발굴 스냅샷 저장 오류] {e}")
+
+
+def build_morning_discovery() -> str:
+    """장 시작 전 신규 종목 발굴 브리핑.
+    전날 장마감 사전계산 스냅샷을 우선 사용하고, 없으면 라이브 호출로 폴백.
+    """
+    if not r:
+        return ""
+
+    cached = _load_latest_discovery_snapshot(max_age_days=3)
+    if cached and cached.get("candidates"):
+        try:
+            return _format_discovery_briefing(
+                cached["candidates"],
+                source="cached",
+                snapshot_date=cached.get("date"),
+            )
+        except Exception as e:
+            print(f"[캐시 발굴 렌더링 오류] {e}")
+
+    # 라이브 폴백
+    candidates, status = _compute_discovery_candidates(max_candidates=5)
+    if status == "no_supply":
+        now_hm = datetime.now(KST).strftime("%H%M")
+        if "0900" <= now_hm <= "1540":
+            return (
+                f"{'━'*28}\n🎯 [신규 종목 발굴]"
+                f"\n  ⓘ 장중 호출 — KIS 수급 집계 API는 장마감 후에만 데이터 제공"
+                f"\n  ⓘ 정규 16:00 장마감 시 사전계산되어 다음날 08:30 브리핑에 반영됩니다"
+            )
+        return (
+            f"{'━'*28}\n🎯 [신규 종목 발굴]"
+            f"\n  ⓘ 전일 사전계산 데이터 없음 + 수급 API 빈 응답 — 발굴 불가"
+        )
+    if status == "no_candidates" or not candidates:
+        return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 오늘은 품질 기준(점수≥6, 지표≥3)을 충족하는 종목이 없습니다"
+    if status:
+        return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 발굴 실패: {status}"
+
+    today = datetime.now(KST).strftime("%Y%m%d")
+    _save_recommendations(today, candidates)
+    return _format_discovery_briefing(candidates, source="live")
+
+
+def _normalize_indicator_label(cond: str) -> str:
+    """지표 라벨 정규화 — 숫자 값/연속일수 등 차이를 묶어서 한 버킷으로 집계."""
+    if not cond:
+        return ""
+    norm = _re_module.sub(r"[-+]?\d+(?:[,.]\d+)*", "N", cond)
+    norm = _re_module.sub(r"\s+", " ", norm).strip()
+    return norm[:80]
+
+
+def _update_indicator_stats(updates: List[Tuple[str, float]]):
+    """검증 결과(지표 라벨, 수익률%)를 인디케이터 통계에 병합."""
+    if not r or not updates:
+        return
+    try:
+        for label, ret_pct in updates:
+            norm = _normalize_indicator_label(label)
+            if not norm:
+                continue
+            raw = r.hget(DISCOVERY_STATS_KEY, norm)
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+            data["count"] = int(data.get("count", 0)) + 1
+            data["wins"] = int(data.get("wins", 0)) + (1 if ret_pct > 0 else 0)
+            data["sum_ret"] = float(data.get("sum_ret", 0.0)) + float(ret_pct)
+            data["last_ts"] = datetime.now(KST).isoformat()
+            r.hset(DISCOVERY_STATS_KEY, norm, json.dumps(data))
+    except Exception as e:
+        print(f"[인디케이터 통계 업데이트 오류] {e}")
+
+
+def get_indicator_reliability(label: str) -> float:
+    """지표의 역사적 실적 기반 신뢰도 배수 [0.5, 1.0, 1.2]."""
+    if not r:
+        return 1.0
+    try:
+        norm = _normalize_indicator_label(label)
+        if not norm:
+            return 1.0
+        raw = r.hget(DISCOVERY_STATS_KEY, norm)
+        if not raw:
+            return 1.0
+        data = json.loads(raw)
+        cnt = int(data.get("count", 0))
+        if cnt < 10:
+            return 1.0
+        hit = int(data.get("wins", 0)) / cnt
+        avg = float(data.get("sum_ret", 0.0)) / cnt
+        if hit < 0.40 or avg < -1.0:
+            return 0.5
+        if hit > 0.65 and avg > 1.0:
+            return 1.2
+        return 1.0
+    except Exception:
+        return 1.0
+
+
+def _format_reliability_summary() -> str:
+    """최근 검증 데이터 기반 전체 승률 한 줄 요약."""
+    if not r:
+        return ""
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_RECO_KEY}:*", count=300)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if not keys:
+            return ""
+        total = 0
+        wins = 0
+        sum_ret = 0.0
+        for k in keys:
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                reco = json.loads(raw)
+                v = (reco.get("verifications") or {}).get("d5")
+                if not v:
+                    continue
+                total += 1
+                ret = float(v.get("return_pct", 0.0))
+                sum_ret += ret
+                if ret > 0:
+                    wins += 1
+            except Exception:
+                continue
+        if total < 3:
+            return ""
+        hit = wins / total * 100
+        avg = sum_ret / total
+        return f"  📊 검증(5일수익): {total}건 중 승률 {hit:.0f}% · 평균 {avg:+.2f}%"
+    except Exception:
+        return ""
+
+
+def job_verify_recommendations():
+    """추천 종목의 +1d/+3d/+5d/+10d 수익률을 갱신하고 지표 통계 업데이트."""
+    if not r or not is_trading_day():
+        return
+    today = datetime.now(KST).strftime("%Y%m%d")
+    now_date = datetime.now(KST).date()
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_RECO_KEY}:*", count=300)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+    except Exception as e:
+        print(f"[검증 스캔 오류] {e}")
+        return
+
+    updated = 0
+    stats_updates: List[Tuple[str, float]] = []
+    for key in keys:
+        try:
+            raw = r.get(key)
+            if not raw:
+                continue
+            reco = json.loads(raw)
+            if reco.get("verified_final"):
+                continue
+            try:
+                reco_date = datetime.strptime(reco["date"], "%Y%m%d").date()
+            except Exception:
+                continue
+            days_elapsed = (now_date - reco_date).days
+            if days_elapsed <= 0:
+                continue
+
+            verifications = reco.setdefault("verifications", {})
+            entry_price = int(reco.get("entry_price", 0))
+            if entry_price <= 0:
+                reco["verified_final"] = True
+                r.set(key, json.dumps(reco), ex=DISCOVERY_RECO_TTL)
+                continue
+
+            fetched_price: Optional[int] = None
+            for horizon, label in [(1, "d1"), (3, "d3"), (5, "d5"), (10, "d10")]:
+                if days_elapsed >= horizon and label not in verifications:
+                    if fetched_price is None:
+                        daily = _get_stock_daily_change(reco["code"])
+                        time.sleep(0.12)
+                        if not daily:
+                            break
+                        fetched_price = int(daily.get("price", 0))
+                    if fetched_price and fetched_price > 0:
+                        ret_pct = (fetched_price - entry_price) / entry_price * 100
+                        verifications[label] = {
+                            "price": fetched_price,
+                            "return_pct": round(ret_pct, 2),
+                            "check_date": today,
+                        }
+                        updated += 1
+
+            # d5 값이 이번 사이클에 새로 기록된 경우 지표 통계 반영
+            d5 = verifications.get("d5")
+            if d5 and not reco.get("d5_counted"):
+                reco["d5_counted"] = True
+                for cond in reco.get("conds", []):
+                    stats_updates.append((cond, float(d5.get("return_pct", 0.0))))
+
+            if "d10" in verifications:
+                reco["verified_final"] = True
+
+            r.set(key, json.dumps(reco), ex=DISCOVERY_RECO_TTL)
+        except Exception as e:
+            print(f"[검증 처리 오류] {key} / {e}")
+
+    if stats_updates:
+        _update_indicator_stats(stats_updates)
+    if updated:
+        print(f"[검증 업데이트] {updated}건 갱신, 통계반영 {len(stats_updates)}건")
+
+
+def build_verification_report() -> str:
+    """주간 발굴 검증 리포트 — 누적 승률 + 최근 완료 케이스 + 지표별 상위/하위."""
+    if not r:
+        return ""
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_RECO_KEY}:*", count=300)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if not keys:
+            return ""
+
+        recos = []
+        for k in keys:
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                recos.append(json.loads(raw))
+            except Exception:
+                continue
+        if not recos:
+            return ""
+
+        def _h(label):
+            items = [(rr, (rr.get("verifications") or {}).get(label)) for rr in recos]
+            items = [(rr, v) for rr, v in items if v]
+            if not items:
+                return 0, 0.0, 0.0
+            n = len(items)
+            wins = sum(1 for _, v in items if float(v.get("return_pct", 0.0)) > 0)
+            avg = sum(float(v.get("return_pct", 0.0)) for _, v in items) / n
+            return n, wins / n * 100, avg
+
+        n1, h1, a1 = _h("d1")
+        n3, h3, a3 = _h("d3")
+        n5, h5, a5 = _h("d5")
+        n10, h10, a10 = _h("d10")
+
+        lines = [f"{'━'*28}", "🧪 [발굴 추천 검증 리포트]"]
+        lines.append("  지평선 | 표본 | 승률 | 평균수익")
+        for label, n, h, a in [("+1d ", n1, h1, a1), ("+3d ", n3, h3, a3),
+                               ("+5d ", n5, h5, a5), ("+10d", n10, h10, a10)]:
+            if n == 0:
+                lines.append(f"  {label} |    - |    - |      -")
+            else:
+                lines.append(f"  {label} | {n:4d} | {h:3.0f}% | {a:+7.2f}%")
+
+        # 지표별 상/하위 (d5 수익 기준, 10건 이상)
+        try:
+            stats_raw = r.hgetall(DISCOVERY_STATS_KEY) or {}
+            if stats_raw:
+                ranked = []
+                for label, raw in stats_raw.items():
+                    try:
+                        data = json.loads(raw)
+                        cnt = int(data.get("count", 0))
+                        if cnt < 10:
+                            continue
+                        hit = int(data.get("wins", 0)) / cnt * 100
+                        avg = float(data.get("sum_ret", 0.0)) / cnt
+                        ranked.append((label, cnt, hit, avg))
+                    except Exception:
+                        continue
+                if ranked:
+                    ranked.sort(key=lambda x: x[3], reverse=True)
+                    lines.append("")
+                    lines.append("  🏆 지표 상위 (샘플≥10, 평균수익 기준)")
+                    for label, cnt, hit, avg in ranked[:3]:
+                        lines.append(f"    · {label} — {cnt}건, {hit:.0f}% 승, {avg:+.2f}%")
+                    if len(ranked) > 3:
+                        lines.append("  ⚠️ 지표 하위")
+                        for label, cnt, hit, avg in ranked[-3:]:
+                            lines.append(f"    · {label} — {cnt}건, {hit:.0f}% 승, {avg:+.2f}%")
+        except Exception:
+            pass
+
+        lines.append("")
+        lines.append("  ※ 표본이 충분히 쌓이면 하위 지표는 자동으로 가중치가 낮아집니다")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[검증 리포트 오류] {e}")
+        return ""
+
+
+# ================== 수동 자금이동 (입금/출금 명령) ==================
+MANUAL_CASHFLOW_PREFIX = "MANUAL_CASHFLOW"     # MANUAL_CASHFLOW:{YYYYMMDD} → list of JSON
+MANUAL_CASHFLOW_LOG = "MANUAL_CASHFLOW_LOG"    # master list (최근 200건)
+
+
+def apply_manual_cashflow(amount: int, label: str = "") -> Dict:
+    """수동 입금/출금을 기록하고 기준 자산(INITIAL_ASSETS_{year})을 보정."""
+    if not r:
+        return {"ok": False, "error": "Redis 미설정"}
+    if amount == 0:
+        return {"ok": False, "error": "금액이 0"}
+    try:
+        today = datetime.now(KST).strftime("%Y%m%d")
+        entry = {
+            "date": today,
+            "amount": int(amount),
+            "label": label or ("입금" if amount > 0 else "출금"),
+            "ts": datetime.now(KST).isoformat(),
+        }
+        entry_json = json.dumps(entry, ensure_ascii=False)
+        r.rpush(f"{MANUAL_CASHFLOW_PREFIX}:{today}", entry_json)
+        r.rpush(MANUAL_CASHFLOW_LOG, entry_json)
+        r.ltrim(MANUAL_CASHFLOW_LOG, -200, -1)
+
+        # 기준자산 보정 (입금 → 기준 ↑, 출금 → 기준 ↓)
+        year = current_year()
+        base_key = f"INITIAL_ASSETS_{year}"
+        try:
+            cur = r.get(base_key)
+            cur_val = int(cur) if cur else 0
+        except Exception:
+            cur_val = 0
+        new_base = cur_val + int(amount)
+        if cur_val > 0:
+            r.set(base_key, str(new_base))
+        return {"ok": True, "entry": entry, "prev_baseline": cur_val, "new_baseline": new_base}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def get_manual_cashflow_summary() -> str:
+    """수동 입출금 로그를 브리핑 섹션으로 포맷."""
+    if not r:
+        return ""
+    try:
+        raw_list = r.lrange(MANUAL_CASHFLOW_LOG, -10, -1) or []
+        if not raw_list:
+            return ""
+        entries = []
+        for raw in raw_list:
+            try:
+                entries.append(json.loads(raw))
+            except Exception:
+                continue
+        if not entries:
+            return ""
+        lines = [f"{'━'*28}", "✍️ [수동 입출금 기록] (최근 10건)"]
+        total = 0
+        for e in entries:
+            amt = int(e.get("amount", 0))
+            total += amt
+            icon = "🟢 입금" if amt > 0 else "🔴 출금"
+            lbl = e.get("label", "")
+            lbl_txt = f" ({lbl})" if lbl and lbl not in ("입금", "출금") else ""
+            lines.append(f"  {icon} {e.get('date', '')}: {_fmt_won_short(amt, sign=True)}{lbl_txt}")
+        icon_total = "🟢" if total >= 0 else "🔴"
+        lines.append(f"  {icon_total} 합계: {_fmt_won_short(total, sign=True)}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+_CASHFLOW_CMD_RE = _re_module.compile(
+    r"^/?(입금|출금|deposit|withdraw|withdraw_krw|deposit_krw)\s+([+-]?\d[\d,_]*)\s*(.*)$",
+    _re_module.IGNORECASE,
+)
+
+
+def parse_cashflow_command(text: str) -> Optional[Dict]:
+    """텍스트 명령 파싱.
+
+    허용 형식:
+      /입금 500000
+      /입금 500,000 배당금
+      /출금 200000 생활비
+      /deposit 1000000
+      /withdraw 500000
+    """
+    if not text:
+        return None
+    m = _CASHFLOW_CMD_RE.match(text.strip())
+    if not m:
+        return None
+    action_raw = m.group(1).lower()
+    amt_str = m.group(2).replace(",", "").replace("_", "")
+    try:
+        amount = int(amt_str)
+    except Exception:
+        return None
+    label = m.group(3).strip()
+    is_deposit = action_raw in ("입금", "deposit", "deposit_krw")
+    if is_deposit:
+        amount = abs(amount)
+    else:
+        amount = -abs(amount)
+    return {"action": "deposit" if is_deposit else "withdraw",
+            "amount": amount, "label": label}
+
+
+def handle_cashflow_text(text: str) -> Optional[str]:
+    """텍스트 메시지를 파싱 → 자금이동 실행 → 회신 문자열 반환. 명령이 아니면 None."""
+    cmd = parse_cashflow_command(text)
+    if not cmd:
+        return None
+    result = apply_manual_cashflow(cmd["amount"], cmd["label"])
+    if not result.get("ok"):
+        return f"❌ 자금이동 실패: {result.get('error', 'unknown')}"
+    action_kr = "입금" if cmd["action"] == "deposit" else "출금"
+    lines = [
+        f"✅ {action_kr} 반영 완료",
+        f"  · 금액: {_fmt_won_short(cmd['amount'], sign=True)}",
+    ]
+    if cmd.get("label"):
+        lines.append(f"  · 라벨: {cmd['label']}")
+    prev_base = int(result.get("prev_baseline", 0))
+    new_base = int(result.get("new_baseline", 0))
+    if prev_base > 0:
+        lines.append(f"  · 기준자산: {_fmt_won_short(prev_base)} → {_fmt_won_short(new_base)}")
+    else:
+        lines.append("  · 기준자산 아직 미설정 — 로그만 기록되었습니다")
+    lines.append("  · 적용 범위: 수익률 분모(INITIAL_ASSETS) + 수동 기록 로그")
+    return "\n".join(lines)
+
+
+# ================== Telegram 명령 리스너 ==================
+def telegram_command_listener_loop():
+    """TELEGRAM_BOT_TOKEN 기반 long-poll. 허용된 chat_id만 명령 수락."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    offset: Optional[int] = None
+    if r:
+        try:
+            saved = r.get("TG_UPDATE_OFFSET")
+            if saved:
+                offset = int(saved)
+        except Exception:
+            offset = None
+    print("[텔레그램 명령 리스너] 시작")
+    while not shutdown_event.is_set():
+        try:
+            params: Dict = {"timeout": 25, "allowed_updates": json.dumps(["message", "channel_post"])}
+            if offset is not None:
+                params["offset"] = offset
+            res = requests.get(url, params=params, timeout=35)
+            if res.status_code != 200:
+                shutdown_event.wait(5)
+                continue
+            data = res.json()
+            if not data.get("ok"):
+                shutdown_event.wait(5)
+                continue
+            for upd in data.get("result", []):
+                try:
+                    offset = int(upd["update_id"]) + 1
+                except Exception:
+                    pass
+                msg = upd.get("message") or upd.get("channel_post") or {}
+                chat = msg.get("chat", {}) or {}
+                chat_id = str(chat.get("id", ""))
+                if chat_id and chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = (msg.get("text") or "").strip()
+                if not text:
+                    continue
+                reply = handle_cashflow_text(text)
+                if reply:
+                    send_alert_message(reply)
+            if offset is not None and r:
+                try:
+                    r.set("TG_UPDATE_OFFSET", str(offset))
+                except Exception:
+                    pass
+        except requests.exceptions.Timeout:
+            continue
+        except Exception as e:
+            print(f"[텔레그램 리스너 오류] {e}")
+            shutdown_event.wait(5)
+
+
+# ================== Discord 명령 리스너 (선택) ==================
+DISCORD_BOT_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+DISCORD_CHANNEL_ID = (os.getenv("DISCORD_CHANNEL_ID") or "").strip()
+
+
+def discord_command_listener_loop():
+    """DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID 설정 시 채널 최근 메시지 폴링.
+    Webhook은 수신을 지원하지 않으므로, 명령 수신을 원하면 Bot Token을 별도 발급해야 함.
+    """
+    if not (DISCORD_BOT_TOKEN and DISCORD_CHANNEL_ID):
+        return
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL_ID}/messages"
+    headers = {"Authorization": f"Bot {DISCORD_BOT_TOKEN}"}
+    last_id: Optional[str] = None
+    if r:
+        try:
+            saved = r.get("DISCORD_LAST_MSG_ID")
+            if saved:
+                last_id = saved
+        except Exception:
+            last_id = None
+    print("[디스코드 명령 리스너] 시작")
+    while not shutdown_event.is_set():
+        try:
+            params = {"limit": 20}
+            if last_id:
+                params["after"] = last_id
+            res = requests.get(url, headers=headers, params=params, timeout=15)
+            if res.status_code != 200:
+                shutdown_event.wait(30)
+                continue
+            msgs = res.json() or []
+            msgs.sort(key=lambda m: int(m.get("id", "0")))
+            for msg in msgs:
+                mid = msg.get("id")
+                if mid:
+                    last_id = mid
+                author = msg.get("author", {}) or {}
+                if author.get("bot"):
+                    continue
+                text = (msg.get("content") or "").strip()
+                if not text:
+                    continue
+                reply = handle_cashflow_text(text)
+                if reply:
+                    send_alert_message(reply)
+            if last_id and r:
+                try:
+                    r.set("DISCORD_LAST_MSG_ID", str(last_id))
+                except Exception:
+                    pass
+            shutdown_event.wait(15)
+        except Exception as e:
+            print(f"[디스코드 리스너 오류] {e}")
+            shutdown_event.wait(30)
+
+
 def build_closing_analysis() -> str:
     """장마감 종합 분석 — 시장 수급/환율/ETF 데이터 중심 (개별 종목 의견 없음).
     신규 매수 종목 의견은 08:30 장 시작 전 브리핑에서만 제공.
+    부수적으로: 발굴 후보 사전계산 + 과거 추천 검증을 함께 실행.
     """
+    # 과거 추천 검증 먼저 (지표 통계 업데이트 → 이번 사전계산에 반영)
+    try:
+        job_verify_recommendations()
+    except Exception as e:
+        print(f"[검증 잡 오류] {e}")
+    # 다음날 08:30 브리핑용 사전계산
+    try:
+        precompute_discovery_snapshot()
+    except Exception as e:
+        print(f"[발굴 사전계산 오류] {e}")
+
     now_ts = datetime.now(KST).strftime("%m/%d %H:%M")
     sections = [f"{'━'*28}\n🌙 [장마감 종합 분석] {now_ts}"]
 
@@ -2555,6 +3270,15 @@ def build_closing_analysis() -> str:
     except Exception:
         pass
 
+    # 7. 발굴 추천 검증 리포트 (주 1회 — 금요일)
+    try:
+        if datetime.now(KST).weekday() == 4:
+            verify_rep = build_verification_report()
+            if verify_rep:
+                sections.append(f"\n{verify_rep}")
+    except Exception as e:
+        print(f"[검증 리포트 오류] {e}")
+
     return "\n".join(sections)
 
 
@@ -2573,9 +3297,14 @@ def run():
     schedule.every().day.at("08:10").do(job_today_listing_etf_reminder)  # 상장 당일 리마인드
     schedule.every().day.at("08:20").do(job_daily_foreign_trend)
     schedule.every().day.at("15:50").do(job_snapshot_foreign_flow)
+    # 검증 잡(매일 16:05) — 과거 추천의 가격 추적 (장마감 리포트에서도 실행되지만 주말/장애 대비 중복 안전)
+    schedule.every().day.at("16:05").do(lambda: is_trading_day() and job_verify_recommendations())
 
     # 실시간 잔고 변동 모니터
     Thread(target=check_holdings_change_loop, daemon=True).start()
+    # 자금이동 명령 리스너 (텔레그램 long-poll / 디스코드 bot polling)
+    Thread(target=telegram_command_listener_loop, daemon=True).start()
+    Thread(target=discord_command_listener_loop, daemon=True).start()
 
     # 최초 실행: 전체 브리핑 (시작 메시지와 함께)
     try:
