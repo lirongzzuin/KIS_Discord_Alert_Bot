@@ -2530,8 +2530,23 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
             score += 3
             conds.append("수급:외국인+기관 동시 순매수")
 
-        # 품질 게이트
-        if score < 6 or len(conds) < 3:
+        # ── 보완 지표 (기술 only 보강) ──
+        if len(chart) >= 4:
+            last3 = [c["close"] for c in chart[-3:]]
+            prev3 = [c["close"] for c in chart[-4:-1]]
+            if all(cur > prv for cur, prv in zip(last3, prev3)):
+                conds.append("추세:3일 연속 양봉")
+                score += 1
+
+        if stock.get("trade_value_mln", 0) >= 50000:
+            conds.append("유동성:거래대금 상위 (500억+)")
+            score += 1
+
+        # 품질 게이트 (수급 데이터 유무에 따라 동적)
+        has_supply = any(c.startswith("수급:") for c in conds)
+        gate_score = 6 if has_supply else 4
+        gate_conds = 3 if has_supply else 2
+        if score < gate_score or len([c for c in conds if not c.startswith("⚠")]) < gate_conds:
             continue
 
         candidates.append({
@@ -2559,8 +2574,13 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
         # 가중치 편차를 점수에 가산 (1.2 → +0.6, 0.5 → -1.5)
         cand["score"] = round(cand["score"] + (avg_w - 1.0) * 3, 2)
 
-    # 가중치 적용 후에도 품질 게이트 재검증 (0.5배 페널티로 6점 미만 떨어진 후보 제거)
-    candidates = [c for c in candidates if c["score"] >= 6 and len(c.get("conds", [])) >= 3]
+    # 가중치 적용 후에도 품질 게이트 재검증
+    def _passes_gate(c):
+        has_s = any(cd.startswith("수급:") for cd in c.get("conds", []))
+        gs = 6 if has_s else 4
+        pos_conds = [cd for cd in c.get("conds", []) if not cd.startswith("⚠")]
+        return c["score"] >= gs and len(pos_conds) >= (3 if has_s else 2)
+    candidates = [c for c in candidates if _passes_gate(c)]
     if not candidates:
         return [], "no_candidates"
 
@@ -2572,7 +2592,9 @@ def _format_discovery_briefing(top: List[Dict], source: str = "live",
                                snapshot_date: Optional[str] = None) -> str:
     """후보 리스트를 브리핑 텍스트로 렌더링. source: 'live' / 'cached'."""
     lines = [f"{'━'*28}", "🎯 [신규 종목 발굴 — 장 시작 전 브리핑]"]
-    lines.append("  (수급·추세·기술·유동성 복합 지표 기반, 점수 ≥ 6)")
+    has_supply = any(any(c.startswith("수급:") for c in t.get("conds",[])) for t in top)
+    gate = "점수 ≥ 6, 수급+기술" if has_supply else "점수 ≥ 4, 기술 지표"
+    lines.append(f"  (추세·기술·유동성·수급 복합 지표 기반, {gate})")
     if source == "cached" and snapshot_date:
         lines.append(f"  ⓘ 전일({snapshot_date}) 장마감 집계 기반 사전계산 데이터")
 
