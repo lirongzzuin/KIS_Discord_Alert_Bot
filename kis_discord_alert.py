@@ -2325,118 +2325,101 @@ def _is_excluded_name(name: str) -> bool:
     return False
 
 
+_NAVER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+def _fetch_naver_volume_leaders(sosok: int = 0, pages: int = 2) -> List[Dict]:
+    """Naver Finance 거래량 상위 종목 스크래핑 — 후보 풀 확보.
+    sosok: 0=KOSPI, 1=KOSDAQ. 페이지당 ~50종목.
+    """
+    result = []
+    link_re = _re_module.compile(
+        r'<a\s+href="/item/main\.naver\?code=(\d{6})"[^>]*class="tltle">\s*([^<]+?)\s*</a>'
+    )
+    num_re = _re_module.compile(r'<td\s+class="number"[^>]*>(.*?)</td>', _re_module.DOTALL)
+    strip_tag = _re_module.compile(r'<[^>]+>')
+    for page in range(1, pages + 1):
+        try:
+            url = f"https://finance.naver.com/sise/sise_quant.naver?sosok={sosok}&page={page}"
+            res = requests.get(url, headers=_NAVER_UA, timeout=12)
+            if res.status_code != 200:
+                continue
+            html = res.text
+            for m in link_re.finditer(html):
+                code = m.group(1)
+                name = m.group(2).strip()
+                chunk_start = m.end()
+                next_link = link_re.search(html, chunk_start)
+                chunk_end = next_link.start() if next_link else chunk_start + 3000
+                chunk = html[chunk_start:chunk_end]
+                raw_nums = num_re.findall(chunk)
+                nums = [strip_tag.sub("", v).replace("\n", "").replace("\t", "").strip()
+                        for v in raw_nums]
+                if len(nums) < 5:
+                    continue
+                result.append({
+                    "code": code, "name": name,
+                    "price": safe_int(nums[0]),
+                    "change_rate": safe_float(nums[2].replace("%", "").replace("+", "")),
+                    "volume": safe_int(nums[3]),
+                    "trade_value_mln": safe_int(nums[4]),
+                })
+        except Exception as e:
+            print(f"[Naver 거래량 상위 오류] sosok={sosok} page={page}: {e}")
+        time.sleep(0.25)
+    return result
+
+
 def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], str]:
-    """KIS 라이브 데이터로 발굴 후보를 계산.
+    """발굴 후보 계산 — Naver 거래량 상위 → 기술 점수 → (보너스) KIS 수급.
 
-    지표 (모두 팩트 데이터 기반):
-      · 외국인/기관 당일+연속 순매수 (Redis 시계열)
-      · 거래량: 당일/20일평균 비율
-      · 추세: 이평선 정배열 (현재가 > MA20 > MA60)
-      · RSI(14): 30~60 구간 선호 (과매수/과매도 회피)
-      · 52주 위치: 25~70% 선호, 90%+ 페널티
-      · 유동성: 당일 거래대금 100억원 이상
-      · 저가주 제외 (<1,000원), ETF/ETN/스팩/우선주 제외
+    1단계: Naver Finance sise_quant KOSPI+KOSDAQ 거래량 상위 → 후보 풀
+    2단계: 기본 필터 (ETF/스팩 제외, 가격 ≥ 1000, 거래대금 ≥ 100억)
+    3단계: KIS inquire-price + daily-ohlcv → 기술 지표 점수
+    4단계: (보너스) KIS 수급 API or Redis 수급 시계열 → 수급 가산점
+    5단계: 품질 게이트 (≥ 6점, ≥ 3지표) + 신뢰도 가중치
 
-    품질 게이트: 최소 6점 이상 + 3개 이상 지표 충족, 최대 max_candidates 종목.
-
-    Returns: (candidates_list, status_code). status_code:
-      · "" → 정상 (candidates_list 사용)
-      · "no_supply" → 수급 API 빈 응답 (장중 호출 등)
-      · "no_candidates" → 조건 충족 종목 없음
-      · "redis_unavailable" → Redis 미설정
+    Returns: (candidates_list, status_code).
     """
     if not r:
         return [], "redis_unavailable"
 
-    # 1단계: KOSPI + KOSDAQ 수급 데이터 수집
-    all_rows = []
-    for market in ("0000", "0001"):
-        try:
-            fetched = _call_foreign_institution_total(fid_input_iscd=market, fid_div_cls="1", fid_rank_sort="0")
-            all_rows.extend(fetched)
-        except Exception as e:
-            print(f"[발굴: 수급수집 오류 {market}] {e}")
-        time.sleep(0.25)
+    # ── 1단계: Naver 거래량 상위 후보 풀 ──
+    pool: List[Dict] = []
+    for sosok in (0, 1):
+        fetched = _fetch_naver_volume_leaders(sosok=sosok, pages=2)
+        pool.extend(fetched)
 
-    if not all_rows:
-        return [], "no_supply"
+    if not pool:
+        return [], "no_pool"
 
-    daily_flow = {}
-    for row in all_rows:
-        code = (row.get("mksc_shrn_iscd") or "").strip()
-        if not code:
+    # ── 2단계: 기본 필터 ──
+    filtered = []
+    seen_codes = set()
+    for s in pool:
+        code = s["code"]
+        if code in seen_codes:
             continue
-        name = row.get("hts_kor_isnm") or row.get("isnm") or code
-        if _is_excluded_name(name):
+        seen_codes.add(code)
+        if _is_excluded_name(s["name"]):
             continue
-        frgn = safe_int(row.get("frgn_ntby_qty"))
-        orgn = safe_int(row.get("orgn_ntby_qty"))
-        frgn_amt = safe_int(row.get("frgn_ntby_tr_pbmn"))
-        orgn_amt = safe_int(row.get("orgn_ntby_tr_pbmn"))
-        if code in daily_flow and abs(frgn) <= abs(daily_flow[code].get("frgn", 0)):
+        if s["price"] < 1000:
             continue
-        daily_flow[code] = {
-            "name": name, "frgn": frgn, "orgn": orgn,
-            "frgn_amt": frgn_amt, "orgn_amt": orgn_amt,
-        }
-
-    # 2단계: 수급 기반 1차 프리스코어링 (이후 차트 API 호출 종목 축소)
-    prescored = []
-    for code, flow in daily_flow.items():
-        if flow["frgn"] <= 0 and flow["orgn"] <= 0:
+        if s["trade_value_mln"] < 10000:
             continue
+        filtered.append(s)
 
-        base_score = 0
-        conds = []
-        if flow["frgn"] > 0 and flow["orgn"] > 0:
-            base_score += 3
-            conds.append("수급:외국인+기관 동시 순매수")
+    if not filtered:
+        return [], "no_candidates"
 
-        frgn_series = _get_flow_series("FRGN_FLOW", code, days=7)
-        frgn_vals = [v for _, v in frgn_series] if frgn_series else []
-        frgn_consec = 0
-        for v in reversed(frgn_vals):
-            if v > 0:
-                frgn_consec += 1
-            else:
-                break
-        if frgn_consec >= 3:
-            add = 2 + min(frgn_consec - 3, 2)
-            base_score += add
-            conds.append(f"수급:외국인 {frgn_consec}일 연속 순매수")
+    # 거래대금 상위 40 종목만 심화 분석 (API 호출 절약)
+    filtered.sort(key=lambda x: x["trade_value_mln"], reverse=True)
+    top_pool = filtered[:40]
 
-        orgn_series = _get_flow_series("ORGN_FLOW", code, days=7)
-        orgn_vals = [v for _, v in orgn_series] if orgn_series else []
-        orgn_consec = 0
-        for v in reversed(orgn_vals):
-            if v > 0:
-                orgn_consec += 1
-            else:
-                break
-        if orgn_consec >= 3:
-            add = 2 + min(orgn_consec - 3, 2)
-            base_score += add
-            conds.append(f"수급:기관 {orgn_consec}일 연속 순매수")
-
-        if base_score < 2:
-            continue
-
-        prescored.append({
-            "code": code, "name": flow["name"], "pre_score": base_score,
-            "pre_conds": conds, "frgn": flow["frgn"], "orgn": flow["orgn"],
-            "frgn_amt": flow["frgn_amt"], "orgn_amt": flow["orgn_amt"],
-            "frgn_consec": frgn_consec, "orgn_consec": orgn_consec,
-            "frgn_vals": frgn_vals,
-        })
-
-    # 상위 25개만 심화 분석 대상 (API 호출 절약)
-    prescored.sort(key=lambda x: x["pre_score"], reverse=True)
-    top_for_deep = prescored[:25]
-
-    # 3단계: 일별 차트/시세 기반 심화 지표 계산
+    # ── 3단계: KIS 차트/시세 기반 기술 지표 ──
     candidates = []
-    for cand in top_for_deep:
-        code = cand["code"]
+    for stock in top_pool:
+        code = stock["code"]
         daily = _get_stock_daily_change(code)
         time.sleep(0.12)
         if not daily:
@@ -2446,19 +2429,15 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
         trade_amount = daily["trade_amount"]
         if close < 1000:
             continue
-        if trade_amount < 10_000_000_000:  # 100억원 미만 유동성 필터
-            continue
 
-        score = cand["pre_score"]
-        conds = list(cand["pre_conds"])
+        score = 0
+        conds: List[str] = []
 
-        # 당일 양봉
         chg_rate = daily["change_rate"]
         if chg_rate > 0:
             conds.append(f"시세:당일 +{chg_rate:.2f}%")
             score += 1
 
-        # 변동성 페널티 (당일 변동폭 ≥ 8%)
         swing_pct = 0.0
         if daily["high"] and daily["low"] and daily["low"] > 0:
             swing_pct = (daily["high"] - daily["low"]) / daily["low"] * 100
@@ -2466,7 +2445,6 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
                 conds.append(f"⚠변동성:{swing_pct:.1f}%")
                 score -= 2
 
-        # 52주 위치
         pos = None
         if daily["w52_high"] and daily["w52_low"] and daily["w52_high"] > daily["w52_low"]:
             pos = (close - daily["w52_low"]) / (daily["w52_high"] - daily["w52_low"]) * 100
@@ -2477,7 +2455,6 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
                 conds.append(f"⚠위치:52주 {pos:.0f}% (고가 과열)")
                 score -= 2
 
-        # 일별 차트 기반 지표 (MA, RSI, 거래량 비율)
         chart = _fetch_daily_ohlcv(code, days=60)
         time.sleep(0.12)
         if len(chart) >= 21:
@@ -2491,7 +2468,7 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
                 conds.append(f"추세:정배열 (종가>{int(ma20):,}>{int(ma60):,})")
                 score += 2
             elif ma20 and close > ma20 and not ma60:
-                conds.append(f"추세:MA20 상향돌파")
+                conds.append("추세:MA20 상향돌파")
                 score += 1
 
             rsi = _calc_rsi(closes, 14)
@@ -2505,24 +2482,66 @@ def _compute_discovery_candidates(max_candidates: int = 5) -> Tuple[List[Dict], 
 
             if len(volumes) >= 21:
                 avg_vol = sum(volumes[-21:-1]) / 20.0
-                today_vol = volumes[-1] if volumes[-1] > 0 else daily["volume"]
+                today_vol = volumes[-1] if volumes[-1] > 0 else daily.get("volume", 0)
                 if avg_vol > 0:
                     vol_ratio = today_vol / avg_vol
                     if vol_ratio >= 1.5:
                         conds.append(f"거래량:{vol_ratio:.1f}배 (20일평균 대비)")
                         score += 2
 
+        # ── 4단계: 수급 보너스 (KIS API or Redis 시계열) ──
+        frgn = 0
+        orgn = 0
+        frgn_amt = 0
+        orgn_amt = 0
+        frgn_consec = 0
+        orgn_consec = 0
+        frgn_vals: List[int] = []
+
+        frgn_series = _get_flow_series("FRGN_FLOW", code, days=7)
+        frgn_vals = [v for _, v in frgn_series] if frgn_series else []
+        if frgn_vals:
+            frgn = frgn_vals[-1]
+            for v in reversed(frgn_vals):
+                if v > 0:
+                    frgn_consec += 1
+                else:
+                    break
+            if frgn_consec >= 3:
+                add = 2 + min(frgn_consec - 3, 2)
+                score += add
+                conds.append(f"수급:외국인 {frgn_consec}일 연속 순매수")
+
+        orgn_series = _get_flow_series("ORGN_FLOW", code, days=7)
+        orgn_vals = [v for _, v in orgn_series] if orgn_series else []
+        if orgn_vals:
+            orgn = orgn_vals[-1]
+            for v in reversed(orgn_vals):
+                if v > 0:
+                    orgn_consec += 1
+                else:
+                    break
+            if orgn_consec >= 3:
+                add = 2 + min(orgn_consec - 3, 2)
+                score += add
+                conds.append(f"수급:기관 {orgn_consec}일 연속 순매수")
+
+        if frgn > 0 and orgn > 0:
+            score += 3
+            conds.append("수급:외국인+기관 동시 순매수")
+
         # 품질 게이트
         if score < 6 or len(conds) < 3:
             continue
 
         candidates.append({
-            "code": code, "name": cand["name"], "score": score, "conds": conds,
-            "close": close, "chg_rate": chg_rate, "trade_amount": trade_amount,
-            "frgn": cand["frgn"], "orgn": cand["orgn"],
-            "frgn_amt": cand["frgn_amt"], "orgn_amt": cand["orgn_amt"],
-            "frgn_consec": cand["frgn_consec"], "orgn_consec": cand["orgn_consec"],
-            "frgn_vals": cand["frgn_vals"], "w52_pos": pos,
+            "code": code, "name": stock["name"], "score": score, "conds": conds,
+            "close": close, "chg_rate": chg_rate,
+            "trade_amount": trade_amount if trade_amount else int(stock["trade_value_mln"]) * 1_000_000,
+            "frgn": frgn, "orgn": orgn,
+            "frgn_amt": frgn_amt, "orgn_amt": orgn_amt,
+            "frgn_consec": frgn_consec, "orgn_consec": orgn_consec,
+            "frgn_vals": frgn_vals, "w52_pos": pos,
         })
 
     if not candidates:
@@ -2750,17 +2769,10 @@ def build_morning_discovery() -> str:
 
     # 라이브 폴백
     candidates, status = _compute_discovery_candidates(max_candidates=5)
-    if status == "no_supply":
-        now_hm = datetime.now(KST).strftime("%H%M")
-        if "0900" <= now_hm <= "1540":
-            return (
-                f"{'━'*28}\n🎯 [신규 종목 발굴]"
-                f"\n  ⓘ 장중 호출 — KIS 수급 집계 API는 장마감 후에만 데이터 제공"
-                f"\n  ⓘ 정규 16:00 장마감 시 사전계산되어 다음날 08:30 브리핑에 반영됩니다"
-            )
+    if status == "no_pool":
         return (
             f"{'━'*28}\n🎯 [신규 종목 발굴]"
-            f"\n  ⓘ 전일 사전계산 데이터 없음 + 수급 API 빈 응답 — 발굴 불가"
+            f"\n  ⓘ Naver Finance 거래량 데이터 조회 실패 — 발굴 불가"
         )
     if status == "no_candidates" or not candidates:
         return f"{'━'*28}\n🎯 [신규 종목 발굴]\n  ⓘ 오늘은 품질 기준(점수≥6, 지표≥3)을 충족하는 종목이 없습니다"
