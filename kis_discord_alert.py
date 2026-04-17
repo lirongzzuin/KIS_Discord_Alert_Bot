@@ -2607,6 +2607,10 @@ def _format_discovery_briefing(top: List[Dict], source: str = "live",
     if reliability_line:
         lines.append(reliability_line)
 
+    tracking_line = _format_tracking_status()
+    if tracking_line:
+        lines.append(tracking_line)
+
     for rank, c in enumerate(top, 1):
         if c["score"] >= 9:
             grade = "🔴 S"
@@ -2698,11 +2702,32 @@ def _load_latest_discovery_snapshot(max_age_days: int = 3) -> Optional[Dict]:
     return None
 
 
+def _get_market_index_snapshot() -> Dict:
+    """현재 KOSPI/KOSDAQ 지수 + USD/KRW 환율 스냅샷 (추천 시점 시장 맥락 기록용)."""
+    ctx: Dict = {}
+    try:
+        fx = _fetch_fx_from_frankfurter("USD") or _fetch_fx_from_er_api("USD")
+        if fx:
+            ctx["usd_krw"] = round(fx, 2)
+    except Exception:
+        pass
+    try:
+        indices = _fetch_market_indices()
+        if indices:
+            ctx["market_indices"] = indices[:200]
+    except Exception:
+        pass
+    return ctx
+
+
 def _save_recommendations(date_str: str, candidates: List[Dict]):
-    """추천 후보를 검증 추적용 레코드로 저장(중복 시 스킵)."""
+    """추천 후보를 검증 추적용 레코드로 저장(중복 시 스킵).
+    시장 맥락(지수, 환율)을 함께 기록하여 추후 분석에 활용.
+    """
     if not r or not candidates:
         return
     now_iso = datetime.now(KST).isoformat()
+    market_ctx = _get_market_index_snapshot()
     for c in candidates[:5]:
         code = c.get("code", "")
         if not code:
@@ -2715,11 +2740,17 @@ def _save_recommendations(date_str: str, candidates: List[Dict]):
                 "date": date_str,
                 "code": code,
                 "name": c.get("name", ""),
-                "score": int(c.get("score", 0)),
+                "score": round(float(c.get("score", 0)), 2),
                 "conds": list(c.get("conds", [])),
                 "entry_price": int(c.get("close", 0)),
+                "entry_chg_rate": round(float(c.get("chg_rate", 0)), 2),
+                "entry_trade_amount": int(c.get("trade_amount", 0)),
+                "entry_w52_pos": round(float(c["w52_pos"]), 1) if c.get("w52_pos") is not None else None,
                 "entry_ts": now_iso,
-                "verifications": {},   # {"d1": {price, return_pct, check_date}, ...}
+                "market_ctx": market_ctx,
+                "verifications": {},
+                "max_gain_pct": 0.0,
+                "max_drawdown_pct": 0.0,
                 "verified_final": False,
             }
             r.set(key, json.dumps(reco), ex=DISCOVERY_RECO_TTL)
@@ -2953,14 +2984,15 @@ def job_verify_recommendations():
                 continue
 
             fetched_price: Optional[int] = None
+            daily_data: Optional[Dict] = None
             for horizon, label in [(1, "d1"), (3, "d3"), (5, "d5"), (10, "d10")]:
                 if days_elapsed >= horizon and label not in verifications:
                     if fetched_price is None:
-                        daily = _get_stock_daily_change(reco["code"])
+                        daily_data = _get_stock_daily_change(reco["code"])
                         time.sleep(0.12)
-                        if not daily:
+                        if not daily_data:
                             break
-                        fetched_price = int(daily.get("price", 0))
+                        fetched_price = int(daily_data.get("price", 0))
                     if fetched_price and fetched_price > 0:
                         ret_pct = (fetched_price - entry_price) / entry_price * 100
                         verifications[label] = {
@@ -2969,6 +3001,16 @@ def job_verify_recommendations():
                             "check_date": today,
                         }
                         updated += 1
+
+            # max gain / max drawdown 갱신 (매일 현재가 기반)
+            if fetched_price and fetched_price > 0:
+                cur_ret = (fetched_price - entry_price) / entry_price * 100
+                prev_max = float(reco.get("max_gain_pct", 0.0))
+                prev_dd = float(reco.get("max_drawdown_pct", 0.0))
+                if cur_ret > prev_max:
+                    reco["max_gain_pct"] = round(cur_ret, 2)
+                if cur_ret < prev_dd:
+                    reco["max_drawdown_pct"] = round(cur_ret, 2)
 
             # d5 값이 이번 사이클에 새로 기록된 경우 지표 통계 반영
             d5 = verifications.get("d5")
@@ -3150,6 +3192,133 @@ def get_manual_cashflow_summary() -> str:
         return ""
 
 
+def _format_tracking_status() -> str:
+    """현재 추적 중인 추천 건수 + 검증 완료 건수 한 줄 요약."""
+    if not r:
+        return ""
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_RECO_KEY}:*", count=300)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if not keys:
+            return ""
+        tracking = 0
+        done = 0
+        wins_d5 = 0
+        total_d5 = 0
+        for k in keys:
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                rec = json.loads(raw)
+                if rec.get("verified_final"):
+                    done += 1
+                else:
+                    tracking += 1
+                v = rec.get("verifications", {})
+                if "d5" in v:
+                    total_d5 += 1
+                    if float(v["d5"].get("return_pct", 0.0)) > 0:
+                        wins_d5 += 1
+            except Exception:
+                continue
+        parts = [f"  📡 추적 현황: 진행 {tracking}건 · 완료 {done}건"]
+        if total_d5 >= 3:
+            hit = wins_d5 / total_d5 * 100
+            parts.append(f" · 5일 승률 {hit:.0f}% ({total_d5}건)")
+        return "".join(parts)
+    except Exception:
+        return ""
+
+
+def export_discovery_analysis_data() -> str:
+    """모든 추천 레코드를 분석용 텍스트 테이블로 내보내기.
+    Telegram /분석 명령으로 호출. CSV-like 형식.
+    """
+    if not r:
+        return "❌ Redis 미설정"
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{DISCOVERY_RECO_KEY}:*", count=300)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if not keys:
+            return "📊 저장된 추천 데이터 없음"
+
+        recos = []
+        for k in sorted(keys):
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                recos.append(json.loads(raw))
+            except Exception:
+                continue
+        if not recos:
+            return "📊 저장된 추천 데이터 없음"
+
+        lines = [
+            f"📊 [발굴 추천 분석 데이터] 총 {len(recos)}건",
+            f"{'━'*28}",
+        ]
+
+        for rec in recos:
+            v = rec.get("verifications", {})
+            d1 = v.get("d1", {}).get("return_pct", "-")
+            d3 = v.get("d3", {}).get("return_pct", "-")
+            d5 = v.get("d5", {}).get("return_pct", "-")
+            d10 = v.get("d10", {}).get("return_pct", "-")
+            mx = rec.get("max_gain_pct", 0.0)
+            dd = rec.get("max_drawdown_pct", 0.0)
+            ctx = rec.get("market_ctx", {})
+            usd = ctx.get("usd_krw", "-")
+            status = "✅" if rec.get("verified_final") else "⏳"
+
+            lines.append(
+                f"\n{status} {rec.get('date','')} {rec.get('name','')} ({rec.get('code','')}) "
+                f"· {rec.get('score',0)}점 · 진입 {rec.get('entry_price',0):,}원"
+            )
+            lines.append(
+                f"  d1={d1} d3={d3} d5={d5} d10={d10} "
+                f"max↑{mx:+.1f}% max↓{dd:+.1f}%"
+            )
+            conds = rec.get("conds", [])
+            if conds:
+                lines.append(f"  지표: {' · '.join(conds[:5])}")
+            if usd != "-":
+                lines.append(f"  시장: USD/KRW={usd}")
+
+        # 지표 통계 요약
+        stats = r.hgetall(DISCOVERY_STATS_KEY) or {}
+        if stats:
+            lines.append(f"\n{'━'*28}")
+            lines.append("📈 [지표별 성과 통계]")
+            for label, raw in sorted(stats.items()):
+                try:
+                    data = json.loads(raw)
+                    cnt = int(data.get("count", 0))
+                    if cnt == 0:
+                        continue
+                    wins = int(data.get("wins", 0))
+                    avg = float(data.get("sum_ret", 0.0)) / cnt
+                    hit = wins / cnt * 100
+                    lines.append(f"  · {label}: {cnt}건 승률{hit:.0f}% 평균{avg:+.2f}%")
+                except Exception:
+                    continue
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"❌ 데이터 내보내기 실패: {e}"
+
+
 _CASHFLOW_CMD_RE = _re_module.compile(
     r"^/?(입금|출금|deposit|withdraw|withdraw_krw|deposit_krw)\s+([+-]?\d[\d,_]*)\s*(.*)$",
     _re_module.IGNORECASE,
@@ -3185,6 +3354,24 @@ def parse_cashflow_command(text: str) -> Optional[Dict]:
         amount = -abs(amount)
     return {"action": "deposit" if is_deposit else "withdraw",
             "amount": amount, "label": label}
+
+
+def handle_incoming_command(text: str) -> Optional[str]:
+    """수신 메시지를 파싱 → 명령 실행 → 회신 문자열 반환. 명령이 아니면 None.
+    지원 명령: /입금, /출금, /deposit, /withdraw, /분석, /검증
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    if stripped in ("/분석", "/analysis"):
+        return export_discovery_analysis_data()
+    if stripped in ("/검증", "/verify"):
+        rep = build_verification_report()
+        return rep if rep else "📊 아직 검증 데이터가 충분하지 않습니다 (최소 +1거래일 경과 필요)"
+    if stripped in ("/추적", "/tracking"):
+        st = _format_tracking_status()
+        return st if st else "📡 추적 중인 추천이 없습니다"
+    return handle_cashflow_text(text)
 
 
 def handle_cashflow_text(text: str) -> Optional[str]:
@@ -3253,7 +3440,7 @@ def telegram_command_listener_loop():
                 text = (msg.get("text") or "").strip()
                 if not text:
                     continue
-                reply = handle_cashflow_text(text)
+                reply = handle_incoming_command(text)
                 if reply:
                     send_alert_message(reply)
             if offset is not None and r:
@@ -3311,7 +3498,7 @@ def discord_command_listener_loop():
                 text = (msg.get("content") or "").strip()
                 if not text:
                     continue
-                reply = handle_cashflow_text(text)
+                reply = handle_incoming_command(text)
                 if reply:
                     send_alert_message(reply)
             if last_id and r:
